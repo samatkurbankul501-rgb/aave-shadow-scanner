@@ -15,12 +15,14 @@ eth_getLogs напрямую (без create_filter, который требуе�
 и лежит в topics[2]; именно на нём держится позиция (aToken/debtToken),
 его и возвращаем.
 """
+from pathlib import Path
 from web3 import Web3
 
 POOL_POLYGON = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
-# TODO: адрес Pool Aave V3 на Amoy уточнить по деплоямот перед задачей 7.
-# Не подставлять Polygon-адрес: амой-смоук с ним молча даст пустоту.
-POOL_AMOY = None
+POOL_AMOY = None  # После проверки 2026-11-04: Aave V3 на Amoy не задеплоен в aave-address-book
+                 # (нет AaveV3Amoy.ts). Амой-смоук требует либо свой деплой, либо Sepolia.
+                 # Не подставлять Polygon-адрес: амой-смоук с ним молча даст пустоту.
+POOLS = {"polygon": POOL_POLYGON, "amoy": POOL_AMOY}
 
 # Сигнатуры событий Aave V3 Pool (полные, с onBehalfOf)
 SIG_BORROW = "Borrow(address,address,address,uint256,uint256,uint256,uint16)"
@@ -44,6 +46,22 @@ def _user_from_log(log) -> str | None:
     except Exception:
         return None
     return None
+
+
+def save_cursor(last_ok: int, path: Path) -> None:
+    """Персистентный курсор: пишет last_ok в файл (атомарно)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(str(last_ok), encoding="utf-8")
+    tmp.replace(path)
+
+
+def load_cursor(path: Path) -> int | None:
+    """Читает курсор, None если файл отсутствует/бит."""
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
 
 
 def scan_range(w3, from_block: int, to_block: int, pool_addr: str = POOL_POLYGON, batch: int = 20):

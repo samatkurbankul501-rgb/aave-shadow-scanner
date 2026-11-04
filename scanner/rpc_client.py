@@ -7,12 +7,15 @@
 
 Исправления (2026-11-04): get_block_number через свойство w3.eth.block_number
 (метода get_block_number у web3.py нет); rl_hits считается подряд, сброс при успехе.
+Дополнительно: throttling минимум 100ms между вызовами (~10 req/s по спеке).
 """
 import time
 from web3 import Web3
 
 _rl_hits_total = 0
 _rl_hits_consec = 0
+_LAST_CALL_TS = 0.0
+_MIN_INTERVAL = 0.1  # 10 req/s
 
 
 def connect(url: str) -> Web3:
@@ -28,8 +31,6 @@ def _is_429(msg: str) -> bool:
 
 
 def _retry_after_seconds(msg: str) -> float:
-    # В сообщении web3 заголовки недоступны; пробуем вытащить Retry-After
-    # как число из текста, иначе минимум 5с по спеке.
     import re
     m = re.search(r"retry[- ]after[^0-9]*(\d+)", msg, re.IGNORECASE)
     if m:
@@ -37,10 +38,20 @@ def _retry_after_seconds(msg: str) -> float:
     return 5.0
 
 
+def _throttle() -> None:
+    global _LAST_CALL_TS
+    now = time.time()
+    gap = _MIN_INTERVAL - (now - _LAST_CALL_TS)
+    if gap > 0:
+        time.sleep(gap)
+    _LAST_CALL_TS = time.time()
+
+
 def rpc_call(w3: Web3, fn, *args, **kwargs) -> object:
-    """Вызов RPC-метода с backoff на 429 и ретраем на timeout."""
+    """Вызов RPC-метода с throttle, backoff на 429 и ретраем на timeout."""
     global _rl_hits_total, _rl_hits_consec
     for attempt in range(4):
+        _throttle()
         try:
             result = fn(*args, **kwargs)
             _rl_hits_consec = 0

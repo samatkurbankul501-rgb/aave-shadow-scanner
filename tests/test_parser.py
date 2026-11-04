@@ -1,32 +1,17 @@
-"""tests/test_parser.py — фикстурный тест парсера getUserAccountData.
+"""tests/test_parser.py — фикстурный тест продового парсера.
 
-Из спеки: good → hf==1.12, debt_usd==184.5 (коллатерал 184.50 $), len==12;
+Из спеки: good → hf==1.12, debt_usd==184.5 (коллатерал 184.50 $), len==6;
 bad → ValueError.
+
+ВАЖНО: тесты импортируют scanner.parser.parse_account (продовый парсер),
+а не локальный дубликат (как было до починки).
 """
 import json
 from pathlib import Path
 
 import pytest
 
-BASE = 1e8  # Base Currency Unit Aave V3 (8 decimals)
-HF_SCALE = 1e18
-
-
-def parse_account(data: dict) -> dict:
-    """Чистый парсер getUserAccountData → USD + HF (без RPC)."""
-    try:
-        keys = ("totalCollateralBase", "totalDebtBase", "availableBorrowsBase",
-                "currentLiquidationThreshold", "ltv", "healthFactor")
-        vals = [data[k] for k in keys]
-    except (KeyError, TypeError) as e:
-        raise ValueError(f"missing field: {e}") from e
-    collateral_base, debt_base = vals[0], vals[1]
-    return {
-        "collateral_usd": collateral_base / BASE,
-        "debt_usd": debt_base / BASE,
-        "hf": vals[5] / HF_SCALE,
-        "len": len([k for k in keys]),
-    }
+from scanner.parser import parse_account
 
 
 def load_fixture():
@@ -49,3 +34,11 @@ def test_bad_fixture_raises():
         json.loads(fixture["bad"])
     with pytest.raises(ValueError):
         parse_account({})
+
+
+def test_tuple_input():
+    # Продовые getUserAccountData возвращают tuple(6) из web3, а не dict.
+    data = (18_450_000_000, 5_000_000_000, 1_000_000_000, 800_000, 750_000_000_000_000_000, 1_120_000_000_000_000_000)
+    parsed = parse_account(data)
+    assert parsed["hf"] == pytest.approx(1.12)
+    assert parsed["debt_usd"] == pytest.approx(50.0)

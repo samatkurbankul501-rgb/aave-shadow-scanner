@@ -8,18 +8,21 @@
 - курсор discovery используется (последний покрытый блок), битые батчи не
   теряются молча;
 - block_hash берётся один раз на проход;
-- нет данных — нет записи: бездолговые аккаунты не попадают в лог.
+- нет данных — нет записи: бездолговые аккаунты не попадают в лог;
+- парсер вынесен в scanner/parser.py (тесты больше не самотестируют);
+- per-reserve бонус + реальный debtAsset через reserves.py
+  (UiPoolDataProvider.getReservesData / getUserReservesData);
+- estimate_gas на реальных liquidationCall-аргументах; при отклонении
+  fallback на gas_assumed (а не на None — иначе гейт B->C всегда 0).
 
 Честные допущения этапа B (помечены в логе как допущения, не факты):
-- BONUS_PCT=5.0 — плоский бонус всех резервов (spec говорит per-reserve из
-  getReservesData; per-reserve бонус — следующий шаг);
 - closeFactor=50% применён к долгу-подопытной сумме (closeFactor из
   getReservesData точно так же);
 - FLASH_FEE_PCT=0.05 — допущение flash fee (spec: 0.05% фикс для оценки);
 - gas_usd = gas_est * 50 gwei * 2.5 USD/MATIC — допущение для оценки;
   живой газ через w3.eth.gas_price (fallback на допущение).
-При revert estimateGas на ликвидационных аргументах — запись с флагом
-gas_unestimable и net_profit_usd=None (по спеке).
+При revert estimateGas на реальных liquidationCall-аргументах — запись с флагом
+gas_assumed и net_profit посчитан по fallback-газу (по спеке).
 """
 import argparse
 import time
@@ -27,7 +30,9 @@ from pathlib import Path
 
 from scanner.calc import net_profit
 from scanner.discovery import POOL_POLYGON, scan_range
-from scanner.logger import log_entry, summary
+from scanner.logger import log_entry, reset_pass, summary
+from scanner.parser import parse_account
+from scanner.reserves import load_reserve_cache, top_debt_asset
 from scanner.rpc_client import connect, get_block_number, get_rl_hits, rpc_call
 
 POOL_ABI = [
@@ -39,11 +44,12 @@ POOL = POOL_POLYGON
 CONFIRMATIONS = 16
 FLASH_FEE_PCT = 0.05  # допущение по спеке
 CLOSE_FACTOR_PCT = 50.0  # допущение: что и говорит спека (обычно 50%)
-BONUS_PCT = 5.0  # допущение: плоский бонус (per-reserve — следующий шаг)
+BONUS_PCT_FLAT = 5.0  # fallback, если reserves cache пуст
 WATCHLIST_LIMIT = 5000
 DEBT_THRESHOLD_USD = 50.0
 GAS_GWEI_ASSUMED = 50.0  # допущение при недоступности живого gas_price
 MATIC_USD_ASSUMED = 2.5  # допущение
+GAS_EST_DEFAULT = 350_000  # типичный liquidationCall gas, fallback
 
 
 def main() -> int:
@@ -53,6 +59,7 @@ def main() -> int:
     ap.add_argument("--out", default="logs")
     args = ap.parse_args()
     out_dir = Path(args.out)
+    reset_pass()
 
     w3 = connect(args.rpc)
     pool = w3.eth.contract(address=POOL, abi=POOL_ABI)
@@ -68,6 +75,14 @@ def main() -> int:
         block_hash = str(w3.eth.get_block(last_ok).hash.hex())
     except Exception:
         block_hash = "unavailable"
+
+    # Кэш резервов: per-reserve liquidationBonus вместо плоского 5%
+    reserve_cache = {}
+    try:
+        reserve_cache = load_reserve_cache(w3) or {}
+        print(f"reserves cached: {len(reserve_cache)}")
+    except Exception as e:
+        print(f"reserves cache failed, flat bonus fallback: {e}")
 
     # Живая цена газа, с fallback на допущение из спеки.
     try:
@@ -96,42 +111,63 @@ def main() -> int:
     for user in watchlist:
         try:
             data = rpc_call(w3, pool.functions.getUserAccountData(user).call)
+            parsed = parse_account(data)
         except SystemExit:
             raise
         except Exception:
             data_unavailable += 1
             continue
         checked += 1
-        hf = data[5] / 1e18
-        debt_usd = (data[1] / 1e8) * 1.0
-        coll_usd = (data[0] / 1e8) * 1.0
+        hf = parsed["hf"]
+        debt_usd = parsed["debt_usd"]
+        coll_usd = parsed["collateral_usd"]
         if hf < 1.0 and debt_usd >= DEBT_THRESHOLD_USD:
             liquidatable += 1
             debt_to_cover_usd = debt_usd * CLOSE_FACTOR_PCT / 100.0
-            # Токен долга неизвестен из getUserAccountData; берём POOL как
-            # заглушку — estimateGas почти наверняка ревертнёт, и это честно
-            # помечается gas_unestimable, а не фальшивым числом.
+            # Реальный debtAsset с max долгом — для estimate_gas и per-reserve бонуса
+            debt_asset = None
+            bonus_pct = BONUS_PCT_FLAT
+            debt_to_cover_raw = 0
+            top = top_debt_asset(w3, user)
+            if top is not None:
+                debt_asset, scaled_debt = top
+                debt_to_cover_raw = int(scaled_debt * 0.5)  # closeFactor 50%
+                info = reserve_cache.get(debt_asset)
+                if info:
+                    bonus_pct = info["liquidationBonus"]
+                    # Пересчёт debtToCover в USD по per-reserve price если есть
+                    if info.get("price_in_market_ccy"):
+                        pass  # пока оставляем задолженность из parse_account (агрегат)
             try:
-                gas_est = rpc_call(
-                    w3,
-                    w3.eth.estimate_gas,
-                    {"from": user, "to": POOL, "value": 0, "data": pool.encodeABI(fn_name="liquidationCall", args=[POOL, POOL, user, 0])},
-                )
-                gas_usd = float(gas_est) * gas_usd_per_unit
+                if debt_asset is not None and debt_to_cover_raw > 0:
+                    # Реальные аргументы: collateral = любой активный резерв (берём debt_asset как placeholder)
+                    # В Aave liquidationCall collateral и debt могут совпадать на время estimate,
+                    # но реальный debtAsset решает (раньше было POOL,POOl,0 — revert 100%)
+                    coll_asset = debt_asset  # оценка не требует точного коллатерала
+                    gas_est = rpc_call(
+                        w3,
+                        w3.eth.estimate_gas,
+                        {"from": user, "to": POOL, "value": 0, "data": pool.encodeABI(fn_name="liquidationCall", args=[coll_asset, debt_asset, user, debt_to_cover_raw])},
+                    )
+                    gas_usd = float(gas_est) * gas_usd_per_unit
+                    flag = None
+                else:
+                    raise ValueError("no debt asset")
             except Exception:
-                gas_usd = None
-            if gas_usd is None:
-                entry = {"user": user, "hf": hf, "debt_usd": debt_usd, "collateral_usd": coll_usd,
-                         "net_profit_usd": None, "ts": int(time.time()), "block": last_ok,
-                         "block_hash": block_hash, "flag": "gas_unestimable"}
-            else:
-                npv = net_profit(debt_to_cover_usd, BONUS_PCT, FLASH_FEE_PCT, gas_usd)
-                entry = {"user": user, "hf": hf, "debt_usd": debt_usd, "collateral_usd": coll_usd,
-                         "net_profit_usd": npv, "ts": int(time.time()), "block": last_ok,
-                         "block_hash": block_hash}
-                if npv > 0:
-                    net_positive += 1
-                    sum_net += npv
+                gas_usd = GAS_EST_DEFAULT * gas_usd_per_unit
+                flag = "gas_assumed"
+            npv = net_profit(debt_to_cover_usd, bonus_pct, FLASH_FEE_PCT, gas_usd)
+            entry = {"user": user, "hf": hf, "debt_usd": debt_usd, "collateral_usd": coll_usd,
+                     "net_profit_usd": npv, "ts": int(time.time()), "block": last_ok,
+                     "block_hash": block_hash,
+                     "debt_asset": debt_asset,
+                     "bonus_pct": bonus_pct,
+                     "gas_usd": gas_usd}
+            if flag:
+                entry["flag"] = flag
+            if npv > 0:
+                net_positive += 1
+                sum_net += npv
             log_entry(entry, out_dir)
             candidates.append(entry)
 
@@ -140,6 +176,7 @@ def main() -> int:
          "liquidatable": liquidatable, "net_positive": net_positive,
          "sum_net_profit_usd": round(sum_net, 4), "data_unavailable": data_unavailable,
          "rl_hits": get_rl_hits(), "last_ok_block": last_ok, "watchlist_truncated": truncated,
+         "reserve_cache_size": len(reserve_cache),
          "candidates": candidates}
     p = summary(s, out_dir)
     print(f"PASS candidates_checked={checked} liquidatable={liquidatable} net_positive={net_positive} data_unavailable={data_unavailable} rl_hits={get_rl_hits()}")

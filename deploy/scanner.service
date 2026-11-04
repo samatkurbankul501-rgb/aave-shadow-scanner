@@ -1,0 +1,23 @@
+[Unit]
+Description=Aave V3 Shadow Scanner (Stage B)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wsuk-ubuntu
+WorkingDirectory=/opt/aave-scanner
+EnvironmentFile=/opt/aave-scanner/.env
+# POLYGON_RPC берётся из .env, не из кода
+ExecStart=/opt/aave-scanner/.venv/bin/python -m scanner.scan --rpc ${POLYGON_RPC} --out logs
+Restart=always
+RestartSec=300
+StandardOutput=journal
+StandardError=journal
+# Ресурсные лимиты — не даём сканеру съесть сервер
+CPUQuota=50%
+MemoryMax=512M
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
