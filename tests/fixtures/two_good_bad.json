@@ -1,0 +1,12 @@
+{
+  "good": {
+    "totalCollateralBase": 18450000000,
+    "totalDebtBase": 5000000000,
+    "availableBorrowsBase": 1000000000,
+    "currentLiquidationThreshold": 800000,
+    "ltv": 750000000000000000,
+    "healthFactor": 1120000000000000000,
+    "user": "0xabc0000000000000000000000000000000000000"
+  },
+  "bad": "{not json"
+}
