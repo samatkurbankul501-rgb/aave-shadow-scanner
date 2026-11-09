@@ -4,7 +4,7 @@ set -e
 
 echo "=== [1/6] System packages ==="
 sudo apt-get update && sudo apt-get install -y python3.11 python3.11-venv git curl ufw
-sudo python3 --version
+python3.11 --version
 
 echo "=== [2/6] Clone / update ==="
 REPO="${REPO_URL:-https://github.com/yourname/nn.git}"
@@ -42,6 +42,6 @@ sudo systemctl enable aave-scanner
 # journalctl -u aave-scanner -f
 
 echo "=== [6/6] done ==="
-echo "Smoke: $APP/.venv/bin/python -m scanner.scan --rpc \$(grep POLYGON_RPC $APP/.env | cut -d= -f2-) --from_block 55000000 --out logs"
+echo "Smoke: $APP/.venv/bin/python -m scanner.scan --rpc \$(grep POLYGON_RPC $APP/.env | cut -d= -f2-) --from_block <cur-1_200_000> --out logs  # ~2 недели истории; 55M блоков = ~2.6 года"
 echo "Start service: sudo systemctl start aave-scanner"
 echo "Logs: journalctl -u aave-scanner -f"

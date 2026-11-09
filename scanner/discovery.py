@@ -1,7 +1,8 @@
 """discovery: скан логов Pool Aave V3 (Borrow, Supply) -> set[address].
 
 Из спеки: scan_range(from_block, to_block) -> set[address] + курсор частичного
-прохода (последний успешно покрытый блок). Батчи по 20 блоков. Использует
+прохода (последний успешно покрытый блок). Батч по умолчанию 200 блоков,
+при ошибке RPC диапазон делится пополам вплоть до MIN_BATCH. Использует
 eth_getLogs напрямую (без create_filter, который требует eth_newFilter и
 недоступен на бесплатных RPC).
 
@@ -22,14 +23,11 @@ POOL_POLYGON = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
 POOL_AMOY = None  # После проверки 2026-11-04: Aave V3 на Amoy не задеплоен в aave-address-book
                  # (нет AaveV3Amoy.ts). Амой-смоук требует либо свой деплой, либо Sepolia.
                  # Не подставлять Polygon-адрес: амой-смоук с ним молча даст пустоту.
-POOLS = {"polygon": POOL_POLYGON, "amoy": POOL_AMOY}
-
 # Сигнатуры событий Aave V3 Pool (полные, с onBehalfOf)
 SIG_BORROW = "Borrow(address,address,address,uint256,uint256,uint256,uint16)"
 SIG_SUPPLY = "Supply(address,address,address,uint256,uint16)"
 TOPIC_BORROW = Web3.keccak(text=SIG_BORROW)
 TOPIC_SUPPLY = Web3.keccak(text=SIG_SUPPLY)
-TOPIC_WITHDRAW = Web3.keccak(text="Withdraw(address,address,address,uint256)")
 
 ABI = [
     {"anonymous": False, "inputs": [{"indexed": True, "name": "reserve", "type": "address"}, {"indexed": False, "name": "user", "type": "address"}, {"indexed": True, "name": "onBehalfOf", "type": "address"}, {"indexed": False, "name": "amount", "type": "uint256"}, {"indexed": False, "name": "interestRateMode", "type": "uint256"}, {"indexed": False, "name": "borrowRate", "type": "uint256"}, {"indexed": True, "name": "referralCode", "type": "uint16"}], "name": "Borrow", "type": "event"},
@@ -64,37 +62,63 @@ def load_cursor(path: Path) -> int | None:
         return None
 
 
-def scan_range(w3, from_block: int, to_block: int, pool_addr: str = POOL_POLYGON, batch: int = 20):
+MIN_BATCH = 5
+
+
+def _get_logs(w3, cur: int, end: int, pool_addr: str, topic: str):
+    """eth_getLogs с адаптивным уменьшением диапазона при ошибке.
+
+    Бесплатные RPC ругаются на широкие диапазоны; при ошибке режем пополам
+    вплоть до MIN_BATCH блоков, потом пробрасываем исключение — scan_range
+    поставит курсор и продолжит в следующем проходе.
+
+    Returns: (logs, end_used) — end_used = фактически покрытый конец диапазона
+    (может быть меньше запрошенного end после сжатия).
+    """
+    from scanner.rpc_client import rpc_call
+    while True:
+        try:
+            return rpc_call(w3, w3.eth.get_logs, {"fromBlock": cur, "toBlock": end, "address": pool_addr, "topics": [topic]}), end
+        except SystemExit:
+            raise
+        except Exception as e:
+            if end - cur + 1 <= MIN_BATCH:
+                raise
+            end = cur + max(MIN_BATCH, (end - cur + 1) // 2) - 1
+            print(f"getLogs failed ({e}); retry smaller range {cur}-{end}")
+
+
+def scan_range(w3, from_block: int, to_block: int, pool_addr: str = POOL_POLYGON, batch: int = 200):
     """Возвращает (set[address], last_ok_block).
 
     last_ok_block — последний блок, покрытый обоими запросами getLogs.
     При ошибке на середине диапазона возвращает частичный результат и
     курсор; следующий проход продолжает с last_ok_block + 1.
     """
-    from scanner.rpc_client import rpc_call
     users = set()
     last_ok = from_block - 1
     cur = from_block
     while cur <= to_block:
         end = min(cur + batch - 1, to_block)
         batch_ok = True
+        covered_end = end
         for topic in (TOPIC_BORROW, TOPIC_SUPPLY):
             try:
-                logs = rpc_call(w3, w3.eth.get_logs, {"fromBlock": cur, "toBlock": end, "address": pool_addr, "topics": [topic]})
-                for log in logs:
-                    addr = _user_from_log(log)
-                    if addr:
-                        users.add(addr)
+                logs, covered_end = _get_logs(w3, cur, covered_end, pool_addr, topic)
             except SystemExit:
                 raise
             except Exception as e:
-                print(f"getLogs {cur}-{end} failed: {e}; stops at block {cur - 1}")
+                print(f"getLogs {cur}-{covered_end} failed: {e}; stops at block {cur - 1}")
                 batch_ok = False
                 break
+            for log in logs:
+                addr = _user_from_log(log)
+                if addr:
+                    users.add(addr)
         if not batch_ok:
             break
-        last_ok = end
-        cur = end + 1
+        last_ok = covered_end
+        cur = covered_end + 1
     return users, last_ok
 
 
@@ -103,7 +127,7 @@ if __name__ == "__main__":
     from scanner.rpc_client import connect, get_block_number
     ap = argparse.ArgumentParser()
     ap.add_argument("--rpc", required=True)
-    ap.add_argument("--from", dest="from_block", type=int, required=True)
+    ap.add_argument("--from", "--from_block", dest="from_block", type=int, required=True)
     ap.add_argument("--to", type=int, required=False, default=None)
     ap.add_argument("--pool", required=False, default=POOL_POLYGON)
     args = ap.parse_args()

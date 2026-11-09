@@ -59,10 +59,10 @@
 ## Задача 5. scan.py (точка входа, полный проход)
 
 Файлы: scanner/scan.py
-Цель: CLI-проход из спеки (поток 30-60 сек).
+Цель: CLI-проход из спеки (поток 30-60 сек при малом вотч-листе; при 5000 адресов и throttle 100 мс — до ~13 мин).
 Шаги:
 1. argparse: --rpc (обязательный), --from_block (int, дефолт = текущий - 10000), --out (папка логов, дефолт logs).
-2. Связать компоненты: connect → scan_range → getUserAccountData по вотч-листу (лимит 5000, вытеснение бездолговых) → calc.net_profit (fee = 0.05% фикс для оценки, gas по eth_estimateGas/staticcall; revert → gas_unestimable + net=null) → logger.log_entry/summary.
+2. Связать компоненты: connect → scan_range → getUserAccountData по вотч-листу (лимит 5000, вытеснение бездолговых) → calc.net_profit (fee = 0.05% фикс для оценки, gas по eth_estimateGas/staticcall; revert → gas_assumed + net по fallback-газу (GAS_EST_DEFAULT)) → logger.log_entry/summary.
 3. Сухой запуск: python -m scanner.scan --rpc <RPC> --from_block <N> --out logs_smoke → должен завершить проход, записать JSONL + сводный JSON.
 4. Проверка реорга: передавать block_number - 16 как confirmations (глубина 16).
 Проверка: сводный JSON напечатан, JSONL файл существует с 0..N строками.
@@ -72,8 +72,8 @@
 Файлы: tests/test_parser.py, tests/fixtures/two_good_bad.json
 Цель: парсер getUserAccountData с ассертами.
 Шаги:
-1. Сохранить два JSON в tests/fixtures/two_good_bad.json: good (hf 1.12 abc user, debt_usd 184.50, len 12) и bad (обрезанный JSON).
-2. Написать test_parser.py: good → assert hf==1.12, debt_usd==184.5, len==12; bad → assert pytest.raises(ValueError).
+1. Сохранить два JSON в tests/fixtures/two_good_bad.json: good (hf 1.12 abc user, debt_usd 184.50, len 6) и bad (обрезанный JSON).
+2. Написать test_parser.py: good → assert hf==1.12, debt_usd==184.5, len==6; bad → assert pytest.raises(ValueError).
 3. Запустить pytest tests/test_parser.py -q → PASS.
 Проверка: pytest -q (2 passed).
 

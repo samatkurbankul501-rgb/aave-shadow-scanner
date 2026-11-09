@@ -24,13 +24,26 @@ def reset_pass():
 
 
 def log_entry(entry: dict, out_dir: Path = None) -> dict:
-    """Добавляет запись; при дубле по user в том же проходе — обновляет hf/ts."""
+    """Добавляет запись; при дубле по user в том же проходе — обновляет hf/ts
+    и в памяти, и в JSONL (в файле ровно одна строка на user, свежий HF)."""
     global _pass_file
     user = entry.get("user", "")
     if user in _seen:
         old = _seen[user]
-        _seen[user] = {**old, "hf": entry.get("hf", old.get("hf")), "ts": entry.get("ts", old.get("ts"))}
-        return _seen[user]
+        merged = {**old, "hf": entry.get("hf", old.get("hf")), "ts": entry.get("ts", old.get("ts"))}
+        _seen[user] = merged
+        if _pass_file is not None and _pass_file.exists():
+            lines = _pass_file.read_text(encoding="utf-8").splitlines()
+            out = []
+            for line in lines:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    out.append(line)
+                    continue
+                out.append(json.dumps(merged, ensure_ascii=False) if rec.get("user") == user else line)
+            _pass_file.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+        return merged
     _seen[user] = dict(entry)
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)

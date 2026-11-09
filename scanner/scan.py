@@ -22,24 +22,26 @@
 - gas_usd = gas_est * 50 gwei * 2.5 USD/MATIC — допущение для оценки;
   живой газ через w3.eth.gas_price (fallback на допущение).
 При revert estimateGas на реальных liquidationCall-аргументах — запись с флагом
-gas_assumed и net_profit посчитан по fallback-газу (по спеке).
+gas_assumed и net_profit посчитан по fallback-газу (по спеке). Доля fallbackа
+считается (gas_assumed в сводном JSON) — по ней виден реализм оценки газа.
 """
 import argparse
 import time
 from pathlib import Path
 
 from scanner.calc import net_profit
-from scanner.discovery import POOL_POLYGON, scan_range
+from scanner.discovery import POOL_POLYGON, load_cursor, save_cursor, scan_range
 from scanner.logger import log_entry, reset_pass, summary
 from scanner.parser import parse_account
-from scanner.reserves import load_reserve_cache, top_debt_asset
+from scanner.reserves import load_reserve_cache, top_position
 from scanner.rpc_client import connect, get_block_number, get_rl_hits, rpc_call
 
 POOL_ABI = [
     {"inputs": [{"internalType": "address", "name": "user", "type": "address"}], "name": "getUserAccountData", "outputs": [{"internalType": "uint256", "name": "totalCollateralBase", "type": "uint256"}, {"internalType": "uint256", "name": "totalDebtBase", "type": "uint256"}, {"internalType": "uint256", "name": "availableBorrowsBase", "type": "uint256"}, {"internalType": "uint256", "name": "currentLiquidationThreshold", "type": "uint256"}, {"internalType": "uint256", "name": "ltv", "type": "uint256"}, {"internalType": "uint256", "name": "healthFactor", "type": "uint256"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [{"internalType": "address", "name": "collateralAsset", "type": "address"}, {"internalType": "address", "name": "debtAsset", "type": "address"}, {"internalType": "address", "name": "user", "type": "address"}, {"internalType": "address", "name": "debtToCover", "type": "uint256"}], "name": "liquidationCall", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+    {"inputs": [{"internalType": "address", "name": "collateralAsset", "type": "address"}, {"internalType": "address", "name": "debtAsset", "type": "address"}, {"internalType": "address", "name": "user", "type": "address"}, {"internalType": "uint256", "name": "debtToCover", "type": "uint256"}, {"internalType": "bool", "name": "receiveAToken", "type": "bool"}], "name": "liquidationCall", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
 ]
 
+ZERO_ADDRESS = "0x" + "0" * 40  # нейтральный from для симуляции estimateGas
 POOL = POOL_POLYGON
 CONFIRMATIONS = 16
 FLASH_FEE_PCT = 0.05  # допущение по спеке
@@ -50,6 +52,13 @@ DEBT_THRESHOLD_USD = 50.0
 GAS_GWEI_ASSUMED = 50.0  # допущение при недоступности живого gas_price
 MATIC_USD_ASSUMED = 2.5  # допущение
 GAS_EST_DEFAULT = 350_000  # типичный liquidationCall gas, fallback
+
+
+def resolve_from_block(args_from_block, safe_block: int) -> int:
+    """Явный from_block побеждает; иначе голова - 10000 (0 — валидный ввод)."""
+    if args_from_block is not None:
+        return args_from_block
+    return safe_block - 10000
 
 
 def main() -> int:
@@ -65,7 +74,14 @@ def main() -> int:
     pool = w3.eth.contract(address=POOL, abi=POOL_ABI)
     cur_block = get_block_number(w3)
     safe_block = cur_block - CONFIRMATIONS
-    from_block = args.from_block or (safe_block - 10000)
+    from_block = resolve_from_block(args.from_block, safe_block)
+    if from_block > safe_block:
+        raise SystemExit(f"INVALID_RANGE: from_block {from_block} > safe_block {safe_block}")
+    # Если курсор есть и from_block не задан явно — продолжить с него
+    cursor_path = out_dir / "cursor.txt"
+    saved = load_cursor(cursor_path)
+    if saved is not None and args.from_block is None and saved + 1 <= safe_block and saved + 1 >= from_block:
+        from_block = saved + 1
     print(f"scan from_block={from_block} safe_block={safe_block} cur={cur_block}")
 
     users, last_ok = scan_range(w3, from_block, safe_block)
@@ -92,12 +108,13 @@ def main() -> int:
         gas_usd_per_unit = GAS_GWEI_ASSUMED * 1e-9 * MATIC_USD_ASSUMED
 
     pass_start = int(time.time())
-    candidates = []
+    candidates = {}  # user -> entry (дедуп: свежий HF перезаписывает, без дублей в summary)
     checked = 0
     liquidatable = 0
     net_positive = 0
     sum_net = 0.0
     data_unavailable = 0
+    gas_assumed = 0
 
     # При переполнении вотч-листа вытесняем аккаунты без долга:
     # сортировка по адресу — детерминированная (вместо среза множества).
@@ -126,11 +143,12 @@ def main() -> int:
             debt_to_cover_usd = debt_usd * CLOSE_FACTOR_PCT / 100.0
             # Реальный debtAsset с max долгом — для estimate_gas и per-reserve бонуса
             debt_asset = None
+            coll_asset = None
             bonus_pct = BONUS_PCT_FLAT
             debt_to_cover_raw = 0
-            top = top_debt_asset(w3, user)
-            if top is not None:
-                debt_asset, scaled_debt = top
+            pos = top_position(w3, user)
+            if pos is not None:
+                debt_asset, scaled_debt, coll_asset = pos
                 debt_to_cover_raw = int(scaled_debt * 0.5)  # closeFactor 50%
                 info = reserve_cache.get(debt_asset)
                 if info:
@@ -140,15 +158,10 @@ def main() -> int:
                         pass  # пока оставляем задолженность из parse_account (агрегат)
             try:
                 if debt_asset is not None and debt_to_cover_raw > 0:
-                    # Реальные аргументы: collateral = любой активный резерв (берём debt_asset как placeholder)
-                    # В Aave liquidationCall collateral и debt могут совпадать на время estimate,
-                    # но реальный debtAsset решает (раньше было POOL,POOl,0 — revert 100%)
-                    coll_asset = debt_asset  # оценка не требует точного коллатерала
-                    gas_est = rpc_call(
-                        w3,
-                        w3.eth.estimate_gas,
-                        {"from": user, "to": POOL, "value": 0, "data": pool.encodeABI(fn_name="liquidationCall", args=[coll_asset, debt_asset, user, debt_to_cover_raw])},
-                    )
+                    # Реальный debtAsset + топ-коллатерал позиции (placeholder для estimate:
+                    # точный коллатерал не обязателен для газа, но POOL как актив давал revert 100%)
+                    liq_fn = pool.functions.liquidationCall(coll_asset or debt_asset, debt_asset, user, debt_to_cover_raw, False)
+                    gas_est = rpc_call(w3, liq_fn.estimate_gas, {"from": ZERO_ADDRESS, "value": 0})
                     gas_usd = float(gas_est) * gas_usd_per_unit
                     flag = None
                 else:
@@ -156,6 +169,7 @@ def main() -> int:
             except Exception:
                 gas_usd = GAS_EST_DEFAULT * gas_usd_per_unit
                 flag = "gas_assumed"
+                gas_assumed += 1
             npv = net_profit(debt_to_cover_usd, bonus_pct, FLASH_FEE_PCT, gas_usd)
             entry = {"user": user, "hf": hf, "debt_usd": debt_usd, "collateral_usd": coll_usd,
                      "net_profit_usd": npv, "ts": int(time.time()), "block": last_ok,
@@ -165,21 +179,34 @@ def main() -> int:
                      "gas_usd": gas_usd}
             if flag:
                 entry["flag"] = flag
+            # Если кандидат уже в списке (дубль по user в этом проходе) — свежий HF перезаписывает,
+            # а не добавляется второй раз. net_positive/sum пересчитываем со свежими цифрами.
+            log_entry(entry, out_dir)  # JSONL dedup
+            if user in candidates:
+                old_net = candidates[user].get("net_profit_usd", 0.0)
+                if old_net > 0:
+                    net_positive -= 1
+                    sum_net -= old_net
+            candidates[user] = entry
             if npv > 0:
                 net_positive += 1
                 sum_net += npv
-            log_entry(entry, out_dir)
-            candidates.append(entry)
 
     pass_end = int(time.time())
     s = {"pass_start_ts": pass_start, "pass_end_ts": pass_end, "candidates_checked": checked,
          "liquidatable": liquidatable, "net_positive": net_positive,
          "sum_net_profit_usd": round(sum_net, 4), "data_unavailable": data_unavailable,
+         "gas_assumed": gas_assumed,
          "rl_hits": get_rl_hits(), "last_ok_block": last_ok, "watchlist_truncated": truncated,
          "reserve_cache_size": len(reserve_cache),
-         "candidates": candidates}
+         "candidates": list(candidates.values())}
+    # Persist курсора: следующий проход продолжит с last_ok + 1
+    try:
+        save_cursor(last_ok, cursor_path)
+    except Exception as e:
+        print(f"cursor save failed: {e}")
     p = summary(s, out_dir)
-    print(f"PASS candidates_checked={checked} liquidatable={liquidatable} net_positive={net_positive} data_unavailable={data_unavailable} rl_hits={get_rl_hits()}")
+    print(f"PASS candidates_checked={checked} liquidatable={liquidatable} net_positive={net_positive} data_unavailable={data_unavailable} gas_assumed={gas_assumed} rl_hits={get_rl_hits()}")
     print(f"WROTE {p}")
     return 0
 

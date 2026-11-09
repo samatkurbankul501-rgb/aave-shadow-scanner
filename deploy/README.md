@@ -37,7 +37,7 @@ REPO_URL=<url_твоего_репо> ./deploy/setup.sh
 Затем smoke вручную:
 
 ```bash
-/opt/aave-scanner/.venv/bin/python -m scanner.scan --rpc https://polygon-bor-mainnet.public.blastapi.io --from_block 55000000 --out logs
+/opt/aave-scanner/.venv/bin/python -m scanner.scan --rpc https://polygon-bor-mainnet.public.blastapi.io --from_block <cur-1_200_000> --out logs  # ~2 недели истории; 55M блоков = ~2.6 года
 ```
 
 ## 2. Запуск как сервис
@@ -52,7 +52,8 @@ journalctl -u aave-scanner -f
 - `logs/pass_*.json` создаётся, поля `candidates_checked, liquidatable, net_positive`
 - `logs/candidates_*.jsonl` — строки с `net_profit_usd` числом (не None)
 - `data_unavailable < 5%` от `candidates_checked`
-- Нет дубликатов по user в JSONL (дедуп в logger)
+- `gas_assumed` в pass JSON: доля fallback-газа; если >50% — estimateGas от `from: user` массово ревертит, оценка газа не реалистична (этап C пересмотрит)
+- Нет дубликатов по user в JSONL (дедуп в logger, свежий HF в файле)
 - Нет роста nonce — транзакции не шлются, ключей нет
 
 ## 4. Безопасность

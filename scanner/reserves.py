@@ -117,7 +117,6 @@ UIDP_ABI = [
 ];
 
 _cache = {}
-_user_cache = {}
 
 
 def load_reserve_cache(w3, provider: str = PROVIDER_POLYGON, uidp: str = DATA_PROVIDER_POLYGON) -> dict:
@@ -149,29 +148,34 @@ def _reserve_info(r) -> dict:
         "underlyingAsset": get("underlyingAsset", 0),
         "symbol": get("symbol", 2),
         "decimals": get("decimals", 3),
-        "liquidationBonus": float(get("reserveLiquidationBonus", 6)) / 100.0,  # BASIS_POINTS -> %
+        "liquidationBonus": (float(get("reserveLiquidationBonus", 6)) - 10000.0) / 100.0,  # множитель bps (10500 = +5%) -> бонус %
         "price_in_market_ccy": get("priceInMarketReferenceCurrency", 22),
         "isActive": bool(get("isActive", 10)),
         "borrowingEnabled": bool(get("borrowingEnabled", 9)),
     }
 
 
-def top_debt_asset(w3, user: str, provider: str = PROVIDER_POLYGON, uidp: str = DATA_PROVIDER_POLYGON) -> tuple | None:
-    """Реальный debtAsset с max scaledVariableDebt для user.
+def top_position(w3, user: str, provider: str = PROVIDER_POLYGON, uidp: str = DATA_PROVIDER_POLYGON) -> tuple | None:
+    """Реальные debtAsset (max scaledVariableDebt) и collateralAsset (max scaledATokenBalance).
 
-    Returns: (asset_address, scaledDebt) или None при пустой позиции / ошибке.
-    Используется в estimate_gas вместо подстановки POOL как заглушки.
+    Returns: (debt_asset, scaled_debt, collateral_asset | None) или None при
+    пустой позиции / ошибке. collateral_asset — placeholder для estimate_gas:
+    liquidationCall требует адрес коллатерала, но для оценки газа точное
+    совпадение неважно; раньше подстановка POOL давала revert 100%.
     """
     c = w3.eth.contract(address=uidp, abi=UIDP_ABI)
     try:
         user_res, _ = rpc_call(w3, c.functions.getUserReservesData(provider, user).call)
     except Exception:
         return None
-    best = None
+    best_debt = None
+    best_coll = None
     for u in user_res:
-        a, scaled = (u["underlyingAsset"], u["scaledVariableDebt"]) if isinstance(u, dict) else (u[0], u[3])
-        if scaled == 0:
-            continue
-        if best is None or scaled > best[1]:
-            best = (a, scaled)
-    return best
+        a, a_bal, scaled = (u["underlyingAsset"], u["scaledATokenBalance"], u["scaledVariableDebt"]) if isinstance(u, dict) else (u[0], u[1], u[3])
+        if scaled > 0 and (best_debt is None or scaled > best_debt[1]):
+            best_debt = (a, scaled)
+        if a_bal > 0 and (best_coll is None or a_bal > best_coll[1]):
+            best_coll = (a, a_bal)
+    if best_debt is None:
+        return None
+    return best_debt[0], best_debt[1], (best_coll[0] if best_coll else None)
