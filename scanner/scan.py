@@ -61,6 +61,17 @@ def resolve_from_block(args_from_block, safe_block: int) -> int:
     return safe_block - 10000
 
 
+def resume_from_block(saved, args_from_block, safe_block: int) -> int:
+    """Курсор продолжается всегда, даже если отстал больше чем на 10000 блоков.
+
+    Нижняя граница head-10000 применялась раньше и молча пропускала блоки
+    между курсором и ней после долгого простоя сервиса.
+    """
+    if saved is not None and args_from_block is None and saved + 1 <= safe_block:
+        return saved + 1
+    return resolve_from_block(args_from_block, safe_block)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rpc", required=True)
@@ -74,14 +85,11 @@ def main() -> int:
     pool = w3.eth.contract(address=POOL, abi=POOL_ABI)
     cur_block = get_block_number(w3)
     safe_block = cur_block - CONFIRMATIONS
-    from_block = resolve_from_block(args.from_block, safe_block)
-    if from_block > safe_block:
-        raise SystemExit(f"INVALID_RANGE: from_block {from_block} > safe_block {safe_block}")
-    # Если курсор есть и from_block не задан явно — продолжить с него
     cursor_path = out_dir / "cursor.txt"
     saved = load_cursor(cursor_path)
-    if saved is not None and args.from_block is None and saved + 1 <= safe_block and saved + 1 >= from_block:
-        from_block = saved + 1
+    from_block = resume_from_block(saved, args.from_block, safe_block)
+    if from_block > safe_block:
+        raise SystemExit(f"INVALID_RANGE: from_block {from_block} > safe_block {safe_block}")
     print(f"scan from_block={from_block} safe_block={safe_block} cur={cur_block}")
 
     users, last_ok = scan_range(w3, from_block, safe_block)
@@ -153,9 +161,6 @@ def main() -> int:
                 info = reserve_cache.get(debt_asset)
                 if info:
                     bonus_pct = info["liquidationBonus"]
-                    # Пересчёт debtToCover в USD по per-reserve price если есть
-                    if info.get("price_in_market_ccy"):
-                        pass  # пока оставляем задолженность из parse_account (агрегат)
             try:
                 if debt_asset is not None and debt_to_cover_raw > 0:
                     # Реальный debtAsset + топ-коллатерал позиции (placeholder для estimate:

@@ -5,7 +5,7 @@
 """
 from web3 import Web3
 
-from scanner.scan import POOL_ABI, resolve_from_block
+from scanner.scan import POOL_ABI, resolve_from_block, resume_from_block
 
 
 def _liquidation_call():
@@ -29,3 +29,20 @@ def test_resolve_from_block_zero_is_valid():
     assert resolve_from_block(0, 1000) == 0
     assert resolve_from_block(None, 1000) == 1000 - 10000
     assert resolve_from_block(777, 1000) == 777
+
+
+def test_cursor_resume_no_gap_after_long_downtime():
+    # Курсор отстал на 50000 блоков (> head-10000): продолжаем с курсора,
+    # а не прыгаем на head-10000 с пропуском блоков.
+    safe = 1_000_000
+    assert resume_from_block(saved=950_000, args_from_block=None, safe_block=safe) == 950_001
+    # Курсор внутри обычного окна — тоже продолжается
+    assert resume_from_block(saved=999_000, args_from_block=None, safe_block=safe) == 999_001
+
+
+def test_explicit_from_block_beats_cursor_and_no_cursor_default():
+    safe = 1_000_000
+    assert resume_from_block(saved=950_000, args_from_block=777, safe_block=safe) == 777
+    assert resume_from_block(saved=None, args_from_block=None, safe_block=safe) == safe - 10000
+    # Курсор впереди safe_block (реорг/часы) — не идём назад, дефолтное окно
+    assert resume_from_block(saved=safe + 5, args_from_block=None, safe_block=safe) == safe - 10000

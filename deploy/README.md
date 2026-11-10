@@ -52,7 +52,7 @@ journalctl -u aave-scanner -f
 - `logs/pass_*.json` создаётся, поля `candidates_checked, liquidatable, net_positive`
 - `logs/candidates_*.jsonl` — строки с `net_profit_usd` числом (не None)
 - `data_unavailable < 5%` от `candidates_checked`
-- `gas_assumed` в pass JSON: доля fallback-газа; если >50% — estimateGas от `from: user` массово ревертит, оценка газа не реалистична (этап C пересмотрит)
+- `gas_assumed` в pass JSON: доля fallback-газа; если >50% — estimateGas от нейтрального `from: ZERO_ADDRESS` массово ревертит (у нулевого адреса нет токенов на repayment), оценка газа не реалистична (этап C пересмотрит)
 - Нет дубликатов по user в JSONL (дедуп в logger, свежий HF в файле)
 - Нет роста nonce — транзакции не шлются, ключей нет
 

@@ -15,8 +15,11 @@ Python 3.11, web3==8.*, pytest. Маршрут: B (этот код) → C (те�
   доля fallbackа — gas_assumed в сводном JSON, не прятать.
 - discovery: курсор = covered_end (фактически покрытый конец диапазона),
   не запрошенный end батча. Батч по умолчанию 200, сжатие пополам до MIN_BATCH=5.
-- logger dedup: в JSONL ровно одна строка на user, со СВЕЖИМ hf/ts
-  (перезапись файла, см. test_reserves.py::test_logger_dedup).
+- resume: курсор продолжается всегда (resume_from_block), даже если отстал
+  больше чем на 10000 блоков — иначе после долгого простоя блоки пропускаются.
+  Явный --from_block побеждает курсор.
+- logger dedup: в JSONL ровно одна строка на user, ВСЕ поля свежие
+  (hf/ts/net_profit_usd; полный merge, см. test_reserves.py::test_logger_dedup).
 
 ## Деплой
 
@@ -28,4 +31,4 @@ deploy/setup.sh клонирует git HEAD. Коммитить перед де�
 Синхронизировать с кодом: сигнатура net_profit(debt_usd, bonus_pct, fee_pct, gas_usd),
 parse_account len==6, UiPoolDataProvider вместо getUserConfigurationMap,
 батч 200 адаптивный. Проверять grep'ом перед каждой правкой спеки.
-Тесты: python -m pytest tests/ -q (15 шт + 4 discovery).
+Тесты: python -m pytest tests/ -q (18 шт, из них 5 discovery).

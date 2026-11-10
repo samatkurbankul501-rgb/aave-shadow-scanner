@@ -44,6 +44,7 @@ def test_logger_dedup():
     # второй проход — тот же user, dedup внутри reset_pass цикла
     assert r2["hf"] == 0.98
     assert r2["ts"] == 2
+    assert r2["net_profit_usd"] == 3.0  # свежий net, не только hf/ts
     # JSONL: ровно одна строка на user, со СВЕЖИМ hf/ts (спека: оставляем свежий HF)
     files = list(tmp.glob("candidates_*.jsonl"))
     assert len(files) == 1
@@ -51,6 +52,7 @@ def test_logger_dedup():
     assert len(rows) == 1
     assert rows[0]["hf"] == 0.98
     assert rows[0]["ts"] == 2
+    assert rows[0]["net_profit_usd"] == 3.0  # файл не расходится со сводным JSON
     reset_pass()
     # после reset dedup сбрасывается
     r3 = log_entry({"user": "0x1", "hf": 0.90, "ts": 3, "net_profit_usd": 1.0}, tmp)

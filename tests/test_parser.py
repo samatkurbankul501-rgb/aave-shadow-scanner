@@ -1,6 +1,6 @@
 """tests/test_parser.py — фикстурный тест продового парсера.
 
-Из спеки: good → hf==1.12, debt_usd==184.5 (коллатерал 184.50 $), len==6;
+Из спеки: good → hf==1.12, collateral_usd==184.5, debt_usd==50.0, len==6;
 bad → ValueError.
 
 ВАЖНО: тесты импортируют scanner.parser.parse_account (продовый парсер),
