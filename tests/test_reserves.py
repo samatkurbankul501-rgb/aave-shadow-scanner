@@ -4,6 +4,7 @@ reserves: проверка _reserve_info (множитель bps -> %) и топ
 logger: дедуп по user внутри одного прохода.
 """
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,8 @@ def _fake_reserve(bonus_raw=10500, symbol="USDC"):
         "symbol": symbol,
         "decimals": 6,
         "reserveLiquidationBonus": bonus_raw,
+        "variableBorrowIndex": 10**27,
+        "liquidityIndex": 10**27,
         "priceInMarketReferenceCurrency": 100_000_000,
         "isActive": True,
         "borrowingEnabled": True,
@@ -34,6 +37,8 @@ def test_reserve_info_bonus_multiplier_bps_to_pct():
     assert info2["liquidationBonus"] == pytest.approx(10.0)
     info3 = _reserve_info(_fake_reserve(10000))
     assert info3["liquidationBonus"] == pytest.approx(0.0)
+    assert info["variableBorrowIndex"] == 10**27  # нужен для scaledDebt -> реальный долг
+    assert info["liquidityIndex"] == 10**27  # нужен для scaledAToken -> реальный коллатерал (closeFactor)
 
 
 def test_logger_dedup():
@@ -57,3 +62,48 @@ def test_logger_dedup():
     # после reset dedup сбрасывается
     r3 = log_entry({"user": "0x1", "hf": 0.90, "ts": 3, "net_profit_usd": 1.0}, tmp)
     assert r3["hf"] == 0.90
+
+
+def test_logger_no_same_second_collision():
+    # Регрессия: два прохода в одну секунду — РАЗНЫЕ файлы, по одной строке на user
+    reset_pass()
+    tmp = Path(tempfile.mkdtemp())
+    log_entry({"user": "0x1", "hf": 0.9, "ts": 1}, tmp)
+    reset_pass()
+    log_entry({"user": "0x1", "hf": 0.8, "ts": 1}, tmp)
+    files = list(tmp.glob("candidates_*.jsonl"))
+    assert len(files) == 2
+    for f in files:
+        rows = [json.loads(line) for line in f.read_text(encoding="utf-8").splitlines() if line.strip()]
+        assert len(rows) == 1
+    reset_pass()
+
+
+def test_top_position_collateral_requires_user_flag(monkeypatch):
+    from scanner import reserves
+
+    a = "0x" + "aa" * 20
+    b = "0x" + "bb" * 20
+    user_res = [
+        # больший aTokenBalance, но флаг коллатерала ВЫКЛ — не коллатерал
+        {"underlyingAsset": a, "scaledATokenBalance": 100, "usageAsCollateralEnabledOnUser": False, "scaledVariableDebt": 10},
+        {"underlyingAsset": b, "scaledATokenBalance": 50, "usageAsCollateralEnabledOnUser": True, "scaledVariableDebt": 0},
+    ]
+    monkeypatch.setattr(reserves, "rpc_call", lambda *args, **kwargs: (user_res, 0))
+
+    class FakeFunctions:
+        @staticmethod
+        def getUserReservesData(provider, user):
+            return SimpleNamespace(call=lambda **kw: None)
+
+    class FakeContract:
+        functions = FakeFunctions()
+
+    class FakeW3:
+        class eth:
+            @staticmethod
+            def contract(address=None, abi=None):
+                return FakeContract()
+
+    pos = reserves.top_position(FakeW3(), "0xuser")
+    assert pos == (a, 10, b, 50)  # долг — a, коллатерал — b (с флагом) + его scaled-баланс 50

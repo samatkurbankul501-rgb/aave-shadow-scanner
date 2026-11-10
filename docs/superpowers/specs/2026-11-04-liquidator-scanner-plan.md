@@ -30,7 +30,7 @@
 Файлы: scanner/rpc_client.py
 Цель: connect(url)->Web3 + rpc_call с backoff.
 Шаги:
-1. Реализовать connect(url): Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': 10})), проверка w3.is_connected() → иначе raise SystemExit('RPC_DOWN').
+1. Реализовать connect(url): Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': 10})), проверка w3.is_connected() → иначе raise SystemExit('RPC_DOWN'); проверка chain_id == 137 → иначе SystemExit('WRONG_CHAIN').
 2. Реализовать rpc_call(w3, fn, *args): try/except; при 429 — backoff по Retry-After (минимум 5с), инкремент rl_hits; 3 подряд → raise SystemExit('RPC_DOWN'); при timeout — 1 ретрай 2с. Throttle минимум 100ms между вызовами.
 3. Реализовать get_block_number(w3) через свойство w3.eth.block_number (метода get_block_number у web3.py нет).
 4. Тест ручной: python -c "from scanner.rpc_client import connect; print(connect('https://polygon-bor-mainnet.public.blastapi.io').eth.block_number)" — должен печатать номер блока.
@@ -62,7 +62,7 @@
 Цель: CLI-проход из спеки (поток 30-60 сек при малом вотч-листе; при 5000 адресов и throttle 100 мс — до ~13 мин).
 Шаги:
 1. argparse: --rpc (обязательный), --from_block (int, дефолт = текущий - 10000), --out (папка логов, дефолт logs).
-2. Связать компоненты: connect → scan_range → getUserAccountData по вотч-листу (лимит 5000, детерминированный срез sorted(users)[:5000]; долг неизвестен до опроса, вытеснение бездолговых невозможно) → calc.net_profit (fee = 0.05% фикс для оценки, gas по eth_estimateGas от ZERO_ADDRESS на реальных liquidationCall-аргументах; revert → gas_assumed + net по fallback-газу (GAS_EST_DEFAULT)) → logger.log_entry/summary. Курсор персистится в logs/cursor.txt и продолжается всегда (resume_from_block), явный --from_block побеждает.
+2. Связать компоненты: connect → scan_range → getUserAccountData по вотч-листу (лимит 5000, детерминированный срез sorted(users)[:5000]; долг неизвестен до опроса, вытеснение бездолговых невозможно) → calc.net_profit (fee = 0.05% фикс для оценки; closeFactor по контракту calc.coverable_debt: 100% по умолчанию, cap 50% общего долга только при HF>0.95 и обоих резервах >=$2000; debtToCover с топ-актива через borrowIndex; gas по eth_estimateGas от реального ликвидатора с balanceOf+allowance на реальных liquidationCall-аргументах; revert/нет ликвидатора → gas_assumed + net по fallback-газу (GAS_EST_DEFAULT); чтения пиннятся к last_ok) → logger.log_entry/summary. Курсор персистится в logs/cursor.txt и продолжается всегда (resume_from_block), явный --from_block побеждает.
 3. Сухой запуск: python -m scanner.scan --rpc <RPC> --from_block <N> --out logs_smoke → должен завершить проход, записать JSONL + сводный JSON.
 4. Проверка реорга: передавать block_number - 16 как confirmations (глубина 16).
 Проверка: сводный JSON напечатан, JSONL файл существует с 0..N строками.

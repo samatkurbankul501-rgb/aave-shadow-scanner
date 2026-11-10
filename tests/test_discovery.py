@@ -83,3 +83,24 @@ def test_scan_range_mixed_topic_coverage_monotone(monkeypatch):
     users, last_ok = discovery.scan_range(object(), 0, 300, batch=200)
     assert last_ok == 300
     assert users == set()
+
+
+def test_scan_range_partial_failure_returns_cursor(monkeypatch):
+    """Неустранимая ошибка RPC с блока 400: частичный результат + курсор 399.
+
+    Следующий проход продолжит с 400 — блоки не теряются и не пересканируются.
+    """
+    monkeypatch.setattr("scanner.rpc_client._MIN_INTERVAL", 0)
+    from scanner import discovery
+
+    log = {"topics": [b"\x00" * 32, b"\x00" * 32, bytes(12) + bytes.fromhex("aa" * 20)]}
+
+    def fake_get(w3, cur, end, pool_addr, topic):
+        if cur >= 400:
+            raise ValueError("simulated permanent RPC failure")
+        return [log], end
+
+    monkeypatch.setattr(discovery, "_get_logs", fake_get)
+    users, last_ok = discovery.scan_range(object(), 0, 1000, batch=200)
+    assert last_ok == 399
+    assert len(users) == 1

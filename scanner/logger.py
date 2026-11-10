@@ -11,6 +11,7 @@ net_positive, sum_net_profit_usd, candidates}.
 """
 import json
 import time
+import uuid
 from pathlib import Path
 
 _seen = {}
@@ -48,7 +49,9 @@ def log_entry(entry: dict, out_dir: Path = None) -> dict:
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
         if _pass_file is None:
-            _pass_file = out_dir / f"candidates_{int(time.time())}.jsonl"
+            # uuid-суффикс: два прохода в одну секунду не делят файл (append
+            # дал бы дубли по user и нарушил инвариант дедупа)
+            _pass_file = out_dir / f"candidates_{int(time.time())}_{uuid.uuid4().hex[:8]}.jsonl"
         with open(_pass_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     return _seen[user]
@@ -60,7 +63,7 @@ def summary(pass_dict: dict, out_dir: Path = None) -> Path:
     if out_dir is None:
         out_dir = Path("logs")
     out_dir.mkdir(parents=True, exist_ok=True)
-    fpath = out_dir / f"pass_{int(time.time())}.json"
+    fpath = out_dir / f"pass_{int(time.time())}_{uuid.uuid4().hex[:8]}.json"
     with open(fpath, "w", encoding="utf-8") as f:
         json.dump(pass_dict, f, ensure_ascii=False, indent=2)
     _pass_file = None

@@ -1,4 +1,8 @@
-# Deploy: Aave V3 Shadow Scanner -> Ubuntu
+# Deploy: Aave V3 Shadow Scanner -> Ubuntu (22.04/24.04/26.04)
+
+setup.sh берёт python3.11 из apt, если пакет есть (22.04/24.04), иначе системный
+python3 с проверкой >= 3.11 (26.04). Сервис работает под тем же пользователем,
+от которого запущен setup (владелец /opt/aave-scanner и User= unit совпадают).
 
 ## 0. Подключение (сейчас 10.60.100.33 недоступен)
 
@@ -50,9 +54,12 @@ journalctl -u aave-scanner -f
 ## 3. Проверки smoke
 
 - `logs/pass_*.json` создаётся, поля `candidates_checked, liquidatable, net_positive`
+- `reserve_cache_size > 0`: если 0 — ABI UiPoolDataProvider не совпал с деплоем
+  (decode fail) или RPC недоступен; бонус плоский 5%, проверить живым вызовом
+- `pol_price_source: oracle` — цена POL из оракула Aave; `assumed` — fallback-допущение
 - `logs/candidates_*.jsonl` — строки с `net_profit_usd` числом (не None)
 - `data_unavailable < 5%` от `candidates_checked`
-- `gas_assumed` в pass JSON: доля fallback-газа; если >50% — estimateGas от нейтрального `from: ZERO_ADDRESS` массово ревертит (у нулевого адреса нет токенов на repayment), оценка газа не реалистична (этап C пересмотрит)
+- `gas_assumed` в pass JSON: доля fallback-газа; если >50% — не нашлось ликвидатора с балансом+approve debtAsset (или estimateGas ревертит), оценка газа не реалистична (этап C пересмотрит)
 - Нет дубликатов по user в JSONL (дедуп в logger, свежий HF в файле)
 - Нет роста nonce — транзакции не шлются, ключей нет
 
@@ -60,8 +67,12 @@ journalctl -u aave-scanner -f
 
 - RPC ключ только в `/opt/aave-scanner/.env` (chmod 600), не в git
 - Приватных ключей на сервере НЕТ. Stage B только чтение.
-- SSH только по ключу, PasswordAuthentication no, ufw только 22
-- logrotate под logs/
+- SSH только по ключу, PasswordAuthentication no — настройка админа, вне setup.sh
+- ufw: setup добавляет `allow 22/tcp`, но НЕ включает firewall автоматически:
+  на shared-сервере default deny incoming оборвёт чужие inbound-сервисы.
+  `sudo ufw enable` — осознанное решение админа.
+- logrotate ставится setup.sh: daily, rotate 14, compress (окно гейта B->C);
+  cursor.txt не ротацияется
 
 ## 5. Гейт B -> C
 

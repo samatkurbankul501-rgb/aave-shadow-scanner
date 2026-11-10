@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# User подставляется setup.sh под запустившего (владелец /opt/aave-scanner)
 User=wsuk-ubuntu
 WorkingDirectory=/opt/aave-scanner
 EnvironmentFile=/opt/aave-scanner/.env

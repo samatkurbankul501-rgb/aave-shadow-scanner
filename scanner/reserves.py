@@ -9,9 +9,8 @@
 
 После кэширования резерва мы: (1) не дёргаем getReservesData на каждого юзера,
 (2) берём per-reserve liquidationBonus из AggregatedReserveData
-reserveLiquidationBonus и closeFactor неявно (в Aave V3 closeFactor фиксирован
-на уровне протокола: max 50%, и в большинстве случаев равен 50% — берём 50%
-как тот же допуск, но с per-reserve бонусом вместо плоского),
+reserveLiquidationBonus; closeFactor считается по контракту в calc.coverable_debt
+(100% по умолчанию; cap 50% только при HF > 0.95 и обоих резервах >= $2000),
 (3) различаем collateralAsset/debtAsset для estimate_gas.
 """
 from scanner.rpc_client import rpc_call
@@ -116,28 +115,33 @@ UIDP_ABI = [
     },
 ];
 
-_cache = {}
-
-
-def load_reserve_cache(w3, provider: str = PROVIDER_POLYGON, uidp: str = DATA_PROVIDER_POLYGON) -> dict:
+def load_reserve_cache(w3, provider: str = PROVIDER_POLYGON, uidp: str = DATA_PROVIDER_POLYGON) -> tuple[dict, float | None]:
     """Кэшировать getReservesData; ключ underlyingAsset -> info.
 
-    Если UiPoolDataProvider недоступен (RPC down / revert), возвращается пустой
-    dict (нет кэша -> вызовер берёт flat допущения).
+    Returns: (cache, pol_usd) — цена сетевого токена (POL) в USD из оракула
+    Aave (base tuple networkBaseTokenPriceInUsd), None если недоступна.
+    Если UiPoolDataProvider недоступен/ABI не совпал (RPC down / revert /
+    decode error), возвращается ({}, None) — вызов берёт flat допущения;
+    пустой кэш обязан быть виден в сводном JSON (reserve_cache_size=0).
     """
-    global _cache
     c = w3.eth.contract(address=uidp, abi=UIDP_ABI)
     try:
-        reserves, _base = rpc_call(w3, c.functions.getReservesData(provider).call)
+        reserves, base = rpc_call(w3, c.functions.getReservesData(provider).call)
     except Exception as e:
         print(f"reserves cache miss: getReservesData failed: {e}")
-        return {}
+        return {}, None
     out = {}
     for r in reserves:
         asset = r["underlyingAsset"] if isinstance(r, dict) else r[0]
         out[asset] = _reserve_info(r)
-    _cache = out
-    return out
+    pol_usd = None
+    try:
+        price, decimals = base[2], base[3]
+        if price > 0:
+            pol_usd = price / (10 ** decimals)
+    except Exception:
+        pass
+    return out, pol_usd
 
 
 def _reserve_info(r) -> dict:
@@ -149,33 +153,43 @@ def _reserve_info(r) -> dict:
         "symbol": get("symbol", 2),
         "decimals": get("decimals", 3),
         "liquidationBonus": (float(get("reserveLiquidationBonus", 6)) - 10000.0) / 100.0,  # множитель bps (10500 = +5%) -> бонус %
+        "variableBorrowIndex": get("variableBorrowIndex", 13),  # ray: scaledDebt * index // 1e27 = реальный долг
+        "liquidityIndex": get("liquidityIndex", 12),  # ray: scaledATokenBalance * index // 1e27 = реальный коллатерал
         "price_in_market_ccy": get("priceInMarketReferenceCurrency", 22),
         "isActive": bool(get("isActive", 10)),
         "borrowingEnabled": bool(get("borrowingEnabled", 9)),
     }
 
 
-def top_position(w3, user: str, provider: str = PROVIDER_POLYGON, uidp: str = DATA_PROVIDER_POLYGON) -> tuple | None:
+def top_position(w3, user: str, provider: str = PROVIDER_POLYGON, uidp: str = DATA_PROVIDER_POLYGON, block_identifier=None) -> tuple | None:
     """Реальные debtAsset (max scaledVariableDebt) и collateralAsset (max scaledATokenBalance).
 
-    Returns: (debt_asset, scaled_debt, collateral_asset | None) или None при
-    пустой позиции / ошибке. collateral_asset — placeholder для estimate_gas:
-    liquidationCall требует адрес коллатерала, но для оценки газа точное
-    совпадение неважно; раньше подстановка POOL давала revert 100%.
+    Returns: (debt_asset, scaled_debt, collateral_asset | None, coll_scaled_atoken)
+    или None при пустой позиции / ошибке. coll_scaled_atoken — scaled-баланс
+    aToken коллатерала (0 если нет): нужен для closeFactor по контракту
+    (коллатерал резерва в USD >= $2000). collateral_asset — placeholder для
+    estimate_gas: liquidationCall требует адрес коллатерала, но для оценки газа
+    точное совпадение неважно; раньше подстановка POOL давала revert 100%.
+    block_identifier пиннит чтение к блоку лога (иначе штамп блока в JSONL врёт).
     """
     c = w3.eth.contract(address=uidp, abi=UIDP_ABI)
     try:
-        user_res, _ = rpc_call(w3, c.functions.getUserReservesData(provider, user).call)
+        user_res, _ = rpc_call(w3, c.functions.getUserReservesData(provider, user).call, block_identifier=block_identifier)
     except Exception:
         return None
     best_debt = None
     best_coll = None
     for u in user_res:
-        a, a_bal, scaled = (u["underlyingAsset"], u["scaledATokenBalance"], u["scaledVariableDebt"]) if isinstance(u, dict) else (u[0], u[1], u[3])
+        if isinstance(u, dict):
+            a, a_bal, coll_enabled, scaled = u["underlyingAsset"], u["scaledATokenBalance"], u["usageAsCollateralEnabledOnUser"], u["scaledVariableDebt"]
+        else:
+            a, a_bal, coll_enabled, scaled = u[0], u[1], u[2], u[3]
         if scaled > 0 and (best_debt is None or scaled > best_debt[1]):
             best_debt = (a, scaled)
-        if a_bal > 0 and (best_coll is None or a_bal > best_coll[1]):
+        # Коллатералом считаем только актив с включённым флагом у юзера:
+        # иначе estimateGas получал не-коллатерал и ревертил.
+        if coll_enabled and a_bal > 0 and (best_coll is None or a_bal > best_coll[1]):
             best_coll = (a, a_bal)
     if best_debt is None:
         return None
-    return best_debt[0], best_debt[1], (best_coll[0] if best_coll else None)
+    return best_debt[0], best_debt[1], (best_coll[0] if best_coll else None), (best_coll[1] if best_coll else 0)
