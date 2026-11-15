@@ -49,7 +49,7 @@ mkdir -p "$APP/logs"
 echo "=== [4/7] Env check ==="
 if [ ! -f "$APP/.env" ]; then
   echo "Создай $APP/.env с: POLYGON_RPC=https://..."
-  echo "POLYGON_RPC=https://polygon-bor-mainnet.public.blastapi.io" > "$APP/.env"
+  echo "POLYGON_RPC=https://polygon.drpc.org" > "$APP/.env"
 fi
 chmod 600 "$APP/.env"
 

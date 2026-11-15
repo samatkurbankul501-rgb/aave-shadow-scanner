@@ -4,10 +4,11 @@ setup.sh берёт python3.11 из apt, если пакет есть (22.04/24.
 python3 с проверкой >= 3.11 (26.04). Сервис работает под тем же пользователем,
 от которого запущен setup (владелец /opt/aave-scanner и User= unit совпадают).
 
-## 0. Подключение (сейчас 10.60.100.33 недоступен)
+## 0. Подключение (dell-r740 доступен через Tailscale)
 
-IP из таблицы — приватный 10.x, не маршрутизируется из интернета.
-Выбрать один из вариантов:
+Проверено 2026-11-15: `ssh dell-r740` работает с ноутбука (Tailscale 100.86.76.38,
+беспарольно). Приватный 10.60.100.33 из интернета не маршрутизируется — не использовать.
+Если Tailscale отвалится, запасные варианты:
 
 ### Вариант A: Tailscale (самый лёгкий, 3 команды)
 
@@ -38,10 +39,11 @@ chmod +x deploy/setup.sh
 REPO_URL=<url_твоего_репо> ./deploy/setup.sh
 ```
 
-Затем smoke вручную:
+Затем smoke вручную (RPC: polygon.drpc.org проверен с сервера 30/30 на 10 rps;
+1rpc.io нестабилен — Cloudflare/лимиты; blastapi/llamarpc мертвы):
 
 ```bash
-/opt/aave-scanner/.venv/bin/python -m scanner.scan --rpc https://polygon-bor-mainnet.public.blastapi.io --from_block <cur-1_200_000> --out logs  # ~2 недели истории; 55M блоков = ~2.6 года
+/opt/aave-scanner/.venv/bin/python -m scanner.scan --rpc https://polygon.drpc.org --from_block <cur-1_200_000> --out logs  # ~2 недели истории; 55M блоков = ~2.6 года
 ```
 
 ## 2. Запуск как сервис
@@ -57,6 +59,11 @@ journalctl -u aave-scanner -f
 - `reserve_cache_size > 0`: если 0 — ABI UiPoolDataProvider не совпал с деплоем
   (decode fail) или RPC недоступен; бонус плоский 5%, проверить живым вызовом
 - `pol_price_source: oracle` — цена POL из оракула Aave; `assumed` — fallback-допущение
+- `swap_cost_pct_assumed` — допущение издержек swap коллатерала обратно в debt-актив (этап B, комиссия DEX); slippage не моделируется — этап C заменит живыми котировками
+- `liq_fee_unreadable == 0` — protocol fee прочитан по всем резервам; если >0, бонус этих резервов считается gross (завышен), net_profit оптимистичен
+- `logs/watchlist.txt` создан; `watchlist_persisted` — сколько юзеров перепроверяется в следующем проходе; `watchlist_carried` > 0 на втором проходе — персистентность работает (бездолговые вычищаются после опроса)
+- `reserve_blocked` — кандидаты, пропущенные из-за inactive/paused/grace-резервов (ликвидация по ним ревертит); `emode_unreadable` — eMode-категории не прочитаны (бонус fallback на резервный, оптимистичен для eMode-позиций)
+- `cover_limit` в JSONL (collateral|dust) — покрытие урезано достаточностью коллатерала или анти-пылевым правилом $1000; прибыль считается с урезанного debt_to_cover_usd
 - `logs/candidates_*.jsonl` — строки с `net_profit_usd` числом (не None)
 - `data_unavailable < 5%` от `candidates_checked`
 - `gas_assumed` в pass JSON: доля fallback-газа; если >50% — не нашлось ликвидатора с балансом+approve debtAsset (или estimateGas ревертит), оценка газа не реалистична (этап C пересмотрит)

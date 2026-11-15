@@ -6,6 +6,7 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 from web3 import Web3
 
 from scanner.scan import POOL_ABI, resolve_from_block, resume_from_block
@@ -154,7 +155,7 @@ def test_main_full_pass_offline(monkeypatch, tmp_path):
 
         @staticmethod
         def get_block(n):
-            return SimpleNamespace(hash=SimpleNamespace(hex=lambda: "0xdeadbeef"))
+            return SimpleNamespace(hash=SimpleNamespace(hex=lambda: "0xdeadbeef"), timestamp=1700000000)
 
         @staticmethod
         def get_logs(f):
@@ -163,13 +164,13 @@ def test_main_full_pass_offline(monkeypatch, tmp_path):
     class FakeW3:
         eth = FakeEth()
 
-    info = {"liquidationBonus": 5.0, "variableBorrowIndex": 10**27, "liquidityIndex": 10**27, "decimals": 6, "price_in_market_ccy": 10**8}
-    coll_info = {"liquidationBonus": 5.0, "variableBorrowIndex": 10**27, "liquidityIndex": 10**27, "decimals": 6, "price_in_market_ccy": 10**8}
+    info = {"liquidationBonus": 6.3, "liquidationBonusGross": 7.0, "liquidationProtocolFee": 1000, "variableBorrowIndex": 10**27, "liquidityIndex": 10**27, "decimals": 6, "price_in_market_ccy": 10**8, "isActive": True, "isPaused": False}
+    coll_info = {"liquidationBonus": 4.5, "liquidationBonusGross": 5.0, "liquidationProtocolFee": 1000, "variableBorrowIndex": 10**27, "liquidityIndex": 10**27, "decimals": 6, "price_in_market_ccy": 10**8, "isActive": True, "isPaused": False}
     monkeypatch.setattr(scan, "connect", lambda url: FakeW3())
     monkeypatch.setattr(scan, "get_block_number", lambda w3: 1000)
     monkeypatch.setattr(scan, "scan_range", lambda w3, a, b: ({user}, 984))
     monkeypatch.setattr(scan, "load_reserve_cache", lambda w3: ({debt_asset: info, coll_asset: coll_info}, 0.5))
-    monkeypatch.setattr(scan, "top_position", lambda w3, u, block_identifier=None: (debt_asset, 100 * 10**6, coll_asset, 200 * 10**6))
+    monkeypatch.setattr(scan, "top_position", lambda w3, u, reserve_cache=None, block_identifier=None: (debt_asset, 100 * 10**6, coll_asset, 200 * 10**6, 0))
     monkeypatch.setattr("sys.argv", ["scan", "--rpc", "x", "--out", str(tmp_path)])
 
     assert scan.main() == 0
@@ -181,15 +182,276 @@ def test_main_full_pass_offline(monkeypatch, tmp_path):
     assert s["gas_assumed"] == 1
     assert s["pol_price_usd"] == 0.5
     assert s["pol_price_source"] == "oracle"
+    assert s["swap_cost_pct_assumed"] == scan.SWAP_COST_PCT_ASSUMED
+    assert s["liq_fee_unreadable"] == 0
     assert s["last_ok_block"] == 984
     assert (tmp_path / "cursor.txt").read_text(encoding="utf-8") == "984"
     cand = s["candidates"][0]
     assert cand["block"] == 984
     assert cand["flag"] == "gas_assumed"
-    assert cand["bonus_pct"] == 5.0
+    assert cand["bonus_pct"] == 4.5  # net-бонус КОЛЛАТЕРАЛА (не debt-резерва 6.3)
+    assert cand["liquidation_protocol_fee_bps"] == 1000
+    assert cand["swap_cost_pct"] == scan.SWAP_COST_PCT_ASSUMED
     # Резерв долга $100 < $2000 -> coverable_debt=1.0 (small-reserve правило),
     # покрывается весь долг $100; net = 100*5% - fee - gas > 0
     assert s["net_positive"] == 1
     rows = [json.loads(line) for line in list(tmp_path.glob("candidates_*.jsonl"))[0].read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 1
     assert rows[0]["user"] == user
+    assert s["watchlist_persisted"] == 1
+    assert (tmp_path / "watchlist.txt").read_text(encoding="utf-8").strip() == user
+
+
+def test_watchlist_helpers_roundtrip(tmp_path):
+    from scanner.scan import load_watchlist, save_watchlist
+    p = tmp_path / "watchlist.txt"
+    assert load_watchlist(p) == set()  # файла нет
+    save_watchlist({"0xb", "0xa"}, p)
+    assert load_watchlist(p) == {"0xa", "0xb"}
+    assert p.read_text(encoding="utf-8") == "0xa\n0xb\n"  # детерминированный порядок
+    save_watchlist(set(), p)
+    assert load_watchlist(p) == set()
+    p.write_text("", encoding="utf-8")
+    assert load_watchlist(p) == set()
+
+
+def _two_pass_fakes(monkeypatch, tmp_path, user_a, user_b):
+    """Общие фейки для тестов персистентного вотч-листа: A с долгом (здоров), B без долга."""
+    import scanner.scan as scan
+    from scanner import rpc_client
+
+    monkeypatch.setattr(rpc_client, "_MIN_INTERVAL", 0)
+    healthy = (200 * 10**8, 100 * 10**8, 0, 800000, 750000, int(1.5 * 10**18))
+    no_debt = (0, 0, 0, 0, 0, 10**30)
+
+    class FakeCall:
+        def __init__(self, val):
+            self.val = val
+
+        def call(self, block_identifier=None):
+            return self.val
+
+    class FakeFunctions:
+        @staticmethod
+        def getUserAccountData(u):
+            return FakeCall(healthy if u == user_a else no_debt)
+
+    class FakeContract:
+        def __init__(self):
+            self.functions = FakeFunctions()
+
+    class FakeEth:
+        gas_price = 30 * 10**9
+
+        @staticmethod
+        def contract(address=None, abi=None):
+            return FakeContract()
+
+        @staticmethod
+        def get_block(n):
+            return SimpleNamespace(hash=SimpleNamespace(hex=lambda: "0xdeadbeef"), timestamp=1700000000)
+
+        @staticmethod
+        def get_logs(f):
+            return []
+
+    class FakeW3:
+        eth = FakeEth()
+
+    monkeypatch.setattr(scan, "connect", lambda url: FakeW3())
+    monkeypatch.setattr(scan, "get_block_number", lambda w3: 1006)
+    monkeypatch.setattr(scan, "load_reserve_cache", lambda w3: ({}, None))
+    monkeypatch.setattr("sys.argv", ["scan", "--rpc", "x", "--out", str(tmp_path)])
+    return scan
+
+
+def test_main_watchlist_carried_and_zero_debt_pruned(monkeypatch, tmp_path):
+    """#23: проход 2 без новых событий перепроверяет персистентного юзера;
+    бездолговой B вычищен из вотч-листа после прохода 1."""
+    user_a = Web3.to_checksum_address("0x" + "11" * 20)
+    user_b = Web3.to_checksum_address("0x" + "22" * 20)
+    scan = _two_pass_fakes(monkeypatch, tmp_path, user_a, user_b)
+    discovery = [({user_a, user_b}, 984), (set(), 990)]
+    monkeypatch.setattr(scan, "scan_range", lambda w3, a, b: discovery.pop(0))
+
+    assert scan.main() == 0
+    p1 = list(tmp_path.glob("pass_*.json"))
+    assert len(p1) == 1
+    s1 = json.loads(p1[0].read_text(encoding="utf-8"))
+    assert s1["candidates_checked"] == 2
+    assert s1["watchlist_persisted"] == 1  # B без долга вычищен
+    assert (tmp_path / "watchlist.txt").read_text(encoding="utf-8").strip() == user_a
+
+    assert scan.main() == 0
+    p2 = [p for p in tmp_path.glob("pass_*.json") if p not in p1]
+    assert len(p2) == 1
+    s2 = json.loads(p2[0].read_text(encoding="utf-8"))
+    assert s2["candidates_checked"] == 1  # A перепроверен без новых событий
+    assert s2["watchlist_carried"] == 1
+    assert s2["watchlist_persisted"] == 1
+
+
+def test_main_rpc_down_saves_watchlist(monkeypatch, tmp_path):
+    """#23: RPC_DOWN посреди опроса не теряет обнаруженных юзеров."""
+    user = Web3.to_checksum_address("0x" + "11" * 20)
+    scan = _two_pass_fakes(monkeypatch, tmp_path, user, user)
+
+    class BoomFunctions:
+        @staticmethod
+        def getUserAccountData(u):
+            raise SystemExit("RPC_DOWN")
+
+    class BoomContract:
+        def __init__(self):
+            self.functions = BoomFunctions()
+
+    class BoomEth:
+        gas_price = 30 * 10**9
+
+        @staticmethod
+        def contract(address=None, abi=None):
+            return BoomContract()
+
+        @staticmethod
+        def get_block(n):
+            return SimpleNamespace(hash=SimpleNamespace(hex=lambda: "0xdeadbeef"), timestamp=1700000000)
+
+        @staticmethod
+        def get_logs(f):
+            return []
+
+    class BoomW3:
+        eth = BoomEth()
+
+    monkeypatch.setattr(scan, "connect", lambda url: BoomW3())
+    monkeypatch.setattr(scan, "scan_range", lambda w3, a, b: ({user}, 984))
+
+    with pytest.raises(SystemExit, match="RPC_DOWN"):
+        scan.main()
+    assert (tmp_path / "cursor.txt").read_text(encoding="utf-8") == "984"
+    assert user in (tmp_path / "watchlist.txt").read_text(encoding="utf-8")
+
+
+def _candidate_pass(monkeypatch, tmp_path, account_data, info, coll_info, pos, emode_bitmap=0b100):
+    """Фейки полного прохода с одним кандидатом; eMode-геттеры отвечают категорией 1%."""
+    import scanner.scan as scan
+    from scanner import rpc_client
+
+    monkeypatch.setattr(rpc_client, "_MIN_INTERVAL", 0)
+    user = Web3.to_checksum_address("0x" + "11" * 20)
+    debt_asset = Web3.to_checksum_address("0x" + "22" * 20)
+    coll_asset = Web3.to_checksum_address("0x" + "33" * 20)
+
+    class FakeCall:
+        def __init__(self, val):
+            self.val = val
+
+        def call(self, block_identifier=None):
+            return self.val
+
+    class FakeFunctions:
+        @staticmethod
+        def getUserAccountData(u):
+            return FakeCall(account_data)
+
+        @staticmethod
+        def getEModeCategoryData(cid):
+            return FakeCall((9800, 9850, 10100, "0x" + "00" * 20, "stable"))
+
+        @staticmethod
+        def getEModeCategoryCollateralBitmap(cid):
+            return FakeCall(emode_bitmap)
+
+        @staticmethod
+        def getLiquidationGracePeriod(asset):
+            return FakeCall(0)
+
+    class FakeContract:
+        def __init__(self):
+            self.functions = FakeFunctions()
+
+    class FakeEth:
+        gas_price = 30 * 10**9
+
+        @staticmethod
+        def contract(address=None, abi=None):
+            return FakeContract()
+
+        @staticmethod
+        def get_block(n):
+            return SimpleNamespace(hash=SimpleNamespace(hex=lambda: "0xdeadbeef"), timestamp=1700000000)
+
+        @staticmethod
+        def get_logs(f):
+            return []
+
+    class FakeW3:
+        eth = FakeEth()
+
+    monkeypatch.setattr(scan, "connect", lambda url: FakeW3())
+    monkeypatch.setattr(scan, "get_block_number", lambda w3: 1000)
+    monkeypatch.setattr(scan, "scan_range", lambda w3, a, b: ({user}, 984))
+    monkeypatch.setattr(scan, "load_reserve_cache", lambda w3: ({debt_asset: info, coll_asset: coll_info}, 0.5))
+    monkeypatch.setattr(scan, "top_position", lambda w3, u, reserve_cache=None, block_identifier=None: pos)
+    monkeypatch.setattr("sys.argv", ["scan", "--rpc", "x", "--out", str(tmp_path)])
+    assert scan.main() == 0
+    return json.loads(list(tmp_path.glob("pass_*.json"))[0].read_text(encoding="utf-8"))
+
+
+def _info(gross=7.0, net=6.3, rid=1):
+    return {"liquidationBonus": net, "liquidationBonusGross": gross, "liquidationProtocolFee": 1000,
+            "variableBorrowIndex": 10**27, "liquidityIndex": 10**27, "decimals": 6,
+            "price_in_market_ccy": 10**8, "isActive": True, "isPaused": False, "id": rid}
+
+
+def test_main_emode_bonus_applied(monkeypatch, tmp_path):
+    """#21: eMode-категория 1 (коллатерал в bitmap) -> бонус категории 1% gross,
+    net 0.9% после fee 1000 bps, а не резервные 4.5%."""
+    account_data = (200 * 10**8, 100 * 10**8, 0, 800000, 750000, int(0.97 * 10**18))
+    debt_asset = Web3.to_checksum_address("0x" + "22" * 20)
+    coll_asset = Web3.to_checksum_address("0x" + "33" * 20)
+    pos = (debt_asset, 100 * 10**6, coll_asset, 200 * 10**6, 1)
+    s = _candidate_pass(monkeypatch, tmp_path, account_data, _info(), _info(5.0, 4.5, rid=2), pos)
+    cand = s["candidates"][0]
+    assert cand["bonus_pct"] == pytest.approx(0.9)
+    assert cand["emode_category"] == 1
+    assert s["emode_unreadable"] == 0
+    assert s["net_positive"] == 1
+
+
+def test_main_emode_not_in_bitmap_uses_reserve_bonus(monkeypatch, tmp_path):
+    account_data = (200 * 10**8, 100 * 10**8, 0, 800000, 750000, int(0.97 * 10**18))
+    debt_asset = Web3.to_checksum_address("0x" + "22" * 20)
+    coll_asset = Web3.to_checksum_address("0x" + "33" * 20)
+    pos = (debt_asset, 100 * 10**6, coll_asset, 200 * 10**6, 1)
+    # бит 2 не установлен -> коллатерал вне категории -> резервный net 4.5%
+    s = _candidate_pass(monkeypatch, tmp_path, account_data, _info(), _info(5.0, 4.5, rid=2), pos, emode_bitmap=0b010)
+    assert s["candidates"][0]["bonus_pct"] == pytest.approx(4.5)
+
+
+def test_main_paused_reserve_skipped(monkeypatch, tmp_path):
+    """#26: paused резерв — ликвидация ревертит, кандидат не логируется."""
+    account_data = (200 * 10**8, 100 * 10**8, 0, 800000, 750000, int(0.97 * 10**18))
+    debt_asset = Web3.to_checksum_address("0x" + "22" * 20)
+    coll_asset = Web3.to_checksum_address("0x" + "33" * 20)
+    pos = (debt_asset, 100 * 10**6, coll_asset, 200 * 10**6, 0)
+    paused = _info()
+    paused["isPaused"] = True
+    s = _candidate_pass(monkeypatch, tmp_path, account_data, paused, _info(5.0, 4.5, rid=2), pos)
+    assert s["liquidatable"] == 1
+    assert s["reserve_blocked"] == 1
+    assert s["candidates"] == []
+
+
+def test_main_dust_shrinks_cover(monkeypatch, tmp_path):
+    """#25: HF 0.99, долг резерва $2600, общий $5000 -> cap $2500, но остаток
+    $100 < $1000 (MustNotLeaveDust) -> исполнимо $1600, прибыль считается с него."""
+    account_data = (10000 * 10**8, 5000 * 10**8, 0, 800000, 750000, int(0.99 * 10**18))
+    debt_asset = Web3.to_checksum_address("0x" + "22" * 20)
+    coll_asset = Web3.to_checksum_address("0x" + "33" * 20)
+    pos = (debt_asset, 2600 * 10**6, coll_asset, 10000 * 10**6, 0)
+    s = _candidate_pass(monkeypatch, tmp_path, account_data, _info(), _info(5.0, 4.5, rid=2), pos)
+    cand = s["candidates"][0]
+    assert cand["debt_to_cover_usd"] == pytest.approx(1600.0)
+    assert cand["cover_limit"] == "dust"
+    assert cand["net_profit_usd"] > 0

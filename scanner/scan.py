@@ -5,6 +5,9 @@
 
 Честные допущения этапа B (помечены в логе как допущения, не факты):
 - FLASH_FEE_PCT=0.05 — допущение flash fee (spec: 0.05% фикс для оценки);
+- SWAP_COST_PCT_ASSUMED=0.3 — издержки обмена изъятого коллатерала обратно
+  в debt-актив (комиссия DEX стандартного тира Uniswap V3); slippage/price-impact
+  не моделируется (зависит от живой ликвидности) — этап C заменит живыми котировками;
 - gas_usd: живой gas_price через w3.eth.gas_price; цена POL — из оракула
   Aave (getReservesData), fallback-допущение POL_USD_ASSUMED; gas_price
   fallback — GAS_GWEI_ASSUMED.
@@ -18,10 +21,24 @@
 - debtToCover считается от топ-одного debt-актива: scaledDebt *
   variableBorrowIndex // RAY (целочисленно), USD через per-reserve цену;
   агрегат getUserAccountData — только fallback без данных позиции/кэша;
+- бонус ликвидации — NET после protocol fee (fee с бонусной части, биты 152-167
+  getConfiguration); источник бонуса и fee — КОЛЛАТЕРАЛЬНЫЙ резерв
+  (LiquidationLogic:233-238,595), не debt-резерв;
 - estimateGas от реального ликвидатора из свежих LiquidationCall-логов
   (проверены balanceOf + allowance debtAsset к Pool). ZERO_ADDRESS давал
   гарантированный revert. Нет подходящего ликвидатора / revert — флаг
   gas_assumed и fallback-газ GAS_EST_DEFAULT; доля fallbackа в сводном JSON.
+
+Исправления 2026-11-15 (аудит #21/#23/#24/#25/#26):
+- вотч-лист персистится в watchlist.txt между проходами; бездолговые
+  вычищаются после опроса; RPC_DOWN посреди прохода не теряет юзеров;
+- топ debt/collateral ранжируются по USD через кэш резервов (не по scaled);
+- eMode: бонус категории, если коллатерал в её collateralBitmap
+  (getEModeCategoryData + getEModeCategoryCollateralBitmap), fee — от резерва;
+- покрытие долга ограничено достаточностью коллатерала и анти-пылевым
+  правилом MIN_LEFTOVER_BASE=$1000 (calc.executable_cover_usd);
+- inactive/paused резервы и grace-период (getLiquidationGracePeriod)
+  блокируют кандидата (reserve_blocked в сводном).
 """
 import argparse
 import time
@@ -29,11 +46,11 @@ from pathlib import Path
 
 from web3 import Web3
 
-from scanner.calc import actual_debt_raw, close_factor_pct, coverable_debt, net_profit, token_amount_usd
+from scanner.calc import actual_debt_raw, close_factor_pct, executable_cover_usd, net_liquidation_bonus, net_profit, token_amount_usd
 from scanner.discovery import POOL_POLYGON, load_cursor, save_cursor, scan_range
 from scanner.logger import log_entry, reset_pass, summary
 from scanner.parser import parse_account
-from scanner.reserves import load_reserve_cache, top_position
+from scanner.reserves import emode_category_bonus, grace_period_until, load_reserve_cache, top_position
 from scanner.rpc_client import connect, get_block_number, get_rl_hits, rpc_call
 
 POOL_ABI = [
@@ -44,6 +61,7 @@ POOL_ABI = [
 POOL = POOL_POLYGON
 CONFIRMATIONS = 16
 FLASH_FEE_PCT = 0.05  # допущение по спеке
+SWAP_COST_PCT_ASSUMED = 0.3  # допущение: комиссия DEX (стандартный тир Uniswap V3); slippage не моделируется, этап C — живые котировки
 BONUS_PCT_FLAT = 5.0  # fallback, если reserves cache пуст
 WATCHLIST_LIMIT = 5000
 DEBT_THRESHOLD_USD = 50.0
@@ -128,6 +146,22 @@ def resume_from_block(saved, args_from_block, safe_block: int) -> int:
     return resolve_from_block(args_from_block, safe_block)
 
 
+def load_watchlist(path: Path) -> set[str]:
+    """Персистентный вотч-лист (по адресу на строку); None-подобный сбой -> пустое множество."""
+    try:
+        return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+    except Exception:
+        return set()
+
+
+def save_watchlist(users, path: Path) -> None:
+    """Атомарная запись вотч-листа (tmp + replace, как курсор)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("\n".join(sorted(users)) + ("\n" if users else ""), encoding="utf-8")
+    tmp.replace(path)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--rpc", required=True)
@@ -149,12 +183,21 @@ def main() -> int:
     print(f"scan from_block={from_block} safe_block={safe_block} cur={cur_block}")
 
     users, last_ok = scan_range(w3, from_block, safe_block)
-    print(f"discovery users={len(users)} last_ok_block={last_ok}")
+    # Вотч-лист персистится между проходами (#23): discovery даёт только НОВЫХ
+    # юзеров окна; позиции, у которых HF упал ниже 1 позже без новых событий,
+    # иначе никогда не перепроверялись бы. Бездолговые вычищаются после опроса.
+    watchlist_path = out_dir / "watchlist.txt"
+    carried = load_watchlist(watchlist_path)
+    users |= carried
+    print(f"discovery users={len(users)} (carried {len(carried)}) last_ok_block={last_ok}")
 
+    block_hash, block_ts = "unavailable", 0
     try:
-        block_hash = str(w3.eth.get_block(last_ok).hash.hex())
+        blk = w3.eth.get_block(last_ok)
+        block_hash = str(blk.hash.hex())
+        block_ts = int(blk.timestamp)
     except Exception:
-        block_hash = "unavailable"
+        pass
 
     # Кэш резервов: per-reserve liquidationBonus вместо плоского 5% + цена POL из оракула
     reserve_cache, pol_usd = {}, None
@@ -178,15 +221,19 @@ def main() -> int:
     pass_start = int(time.time())
     candidates = {}  # user -> entry (дедуп: свежий HF перезаписывает, без дублей в summary)
     liq_from_cache = {}  # debt_asset -> проверенный from для estimateGas (или None)
+    emode_cache = {}  # category -> (gross_pct | None, bitmap | None) на проход
     checked = 0
     liquidatable = 0
     net_positive = 0
     sum_net = 0.0
     data_unavailable = 0
     gas_assumed = 0
+    reserve_blocked = 0
+    emode_unreadable = 0
+    zero_debt = set()  # вычитаются из персистентного вотч-листа после опроса
 
-    # При переполнении вотч-листа вытесняем аккаунты без долга:
-    # сортировка по адресу — детерминированная (вместо среза множества).
+    # При переполнении вотч-листа — детерминированный срез sorted(users)[:5000];
+    # бездолговые вычищаются после опроса (долг неизвестен до чтения).
     watchlist = sorted(users)
     truncated = 0
     if len(watchlist) > WATCHLIST_LIMIT:
@@ -210,6 +257,8 @@ def main() -> int:
             hf = parsed["hf"]
             debt_usd = parsed["debt_usd"]
             coll_usd = parsed["collateral_usd"]
+            if debt_usd == 0:
+                zero_debt.add(user)
             if hf < 1.0 and debt_usd >= DEBT_THRESHOLD_USD:
                 liquidatable += 1
                 close_pct = close_factor_pct(hf)
@@ -218,27 +267,59 @@ def main() -> int:
                 debt_asset = None
                 coll_asset = None
                 bonus_pct = BONUS_PCT_FLAT
+                bonus_gross_pct = BONUS_PCT_FLAT
+                bonus_src = None
+                emode_cat = 0
+                cover_limit = None
+                emode_flag = False
                 debt_to_cover_raw = 0
-                pos = top_position(w3, user, block_identifier=last_ok)
+                pos = top_position(w3, user, reserve_cache=reserve_cache, block_identifier=last_ok)
                 if pos is not None:
-                    debt_asset, scaled_debt, coll_asset, coll_scaled = pos
+                    debt_asset, scaled_debt, coll_asset, coll_scaled, emode_cat = pos
                     info = reserve_cache.get(debt_asset)
+                    coll_info = reserve_cache.get(coll_asset) if coll_asset else None
+                    # #26: inactive/paused резерв или grace-период — ликвидация ревертит
+                    blocked = any(i and (not i["isActive"] or i["isPaused"]) for i in (info, coll_info))
+                    if not blocked and block_ts:
+                        blocked = any(a and grace_period_until(w3, a) > block_ts for a in (debt_asset, coll_asset))
+                    if blocked:
+                        reserve_blocked += 1
+                        continue
+                    # Бонус и protocol fee — из КОЛЛАТЕРАЛЬНОГО резерва (LiquidationLogic:233-238,595);
+                    # без данных коллатерала fallback на debt-резерв, затем flat.
+                    bonus_src = coll_info or info
+                    if bonus_src is not None:
+                        bonus_pct = bonus_src["liquidationBonus"]  # net после protocol fee
+                        bonus_gross_pct = bonus_src["liquidationBonusGross"]
+                    # #21: eMode — бонус КАТЕГОРИИ, если коллатерал в её bitmap
+                    # (LiquidationLogic:226-239); fee остаётся от коллатерального резерва.
+                    if emode_cat and coll_info is not None:
+                        cat_gross = emode_category_bonus(w3, emode_cat, coll_info, emode_cache)
+                        if cat_gross is not None:
+                            bonus_gross_pct = cat_gross
+                            bonus_pct = net_liquidation_bonus(cat_gross, coll_info["liquidationProtocolFee"])
+                        elif emode_cache.get(emode_cat) == (None, None):
+                            emode_flag = True
+                            emode_unreadable += 1
                     if info:
-                        bonus_pct = info["liquidationBonus"]
                         actual_raw = actual_debt_raw(scaled_debt, info["variableBorrowIndex"])
                         price = info["price_in_market_ccy"]
-                        frac = close_pct / 100.0  # fallback без данных коллатерала
-                        coll_info = reserve_cache.get(coll_asset) if coll_asset else None
                         if price > 0 and coll_info and coll_info["price_in_market_ccy"] > 0:
-                            # Точное правило контракта: нужны USD-оценки обоих резервов
+                            # Точное правило контракта: cap + достаточность коллатерала
+                            # + анти-пылевое правило MIN_LEFTOVER_BASE (#25)
                             reserve_debt_usd = token_amount_usd(actual_raw, info["decimals"], price)
                             coll_actual = actual_debt_raw(coll_scaled, coll_info["liquidityIndex"])
                             reserve_coll_usd = token_amount_usd(coll_actual, coll_info["decimals"], coll_info["price_in_market_ccy"])
-                            frac = coverable_debt(hf, reserve_debt_usd, reserve_coll_usd, debt_usd)
-                        debt_to_cover_raw = actual_raw if frac >= 1.0 else int(actual_raw * frac)
-                        if price > 0:
+                            cover_usd, cover_limit = executable_cover_usd(hf, reserve_debt_usd, reserve_coll_usd, debt_usd, bonus_gross_pct)
+                            frac_eff = cover_usd / reserve_debt_usd if reserve_debt_usd > 0 else 0.0
+                            debt_to_cover_raw = int(actual_raw * frac_eff)
                             # Прибыль с реально покрываемого актива, не со всех долгов сразу
                             debt_to_cover_usd = token_amount_usd(debt_to_cover_raw, info["decimals"], price)
+                        else:
+                            frac = close_pct / 100.0  # fallback без данных коллатерала
+                            debt_to_cover_raw = actual_raw if frac >= 1.0 else int(actual_raw * frac)
+                            if price > 0:
+                                debt_to_cover_usd = token_amount_usd(debt_to_cover_raw, info["decimals"], price)
                     else:
                         debt_to_cover_raw = scaled_debt * int(close_pct) // 100  # без index — заниженная оценка
                 try:
@@ -256,13 +337,21 @@ def main() -> int:
                     gas_usd = GAS_EST_DEFAULT * gas_usd_per_unit
                     flag = "gas_assumed"
                     gas_assumed += 1
-                npv = net_profit(debt_to_cover_usd, bonus_pct, FLASH_FEE_PCT, gas_usd)
+                npv = net_profit(debt_to_cover_usd, bonus_pct, FLASH_FEE_PCT, gas_usd, SWAP_COST_PCT_ASSUMED)
                 entry = {"user": user, "hf": hf, "debt_usd": debt_usd, "collateral_usd": coll_usd,
                          "net_profit_usd": npv, "ts": int(time.time()), "block": last_ok,
                          "block_hash": block_hash,
                          "debt_asset": debt_asset,
+                         "debt_to_cover_usd": debt_to_cover_usd,
                          "bonus_pct": bonus_pct,
+                         "emode_category": emode_cat or None,
+                         "liquidation_protocol_fee_bps": bonus_src.get("liquidationProtocolFee") if bonus_src else None,
+                         "swap_cost_pct": SWAP_COST_PCT_ASSUMED,
                          "gas_usd": gas_usd}
+                if cover_limit:
+                    entry["cover_limit"] = cover_limit
+                if emode_flag:
+                    entry["emode_bonus_unreadable"] = True
                 if flag:
                     entry["flag"] = flag
                 # Если кандидат уже в списке (дубль по user в этом проходе) — свежий HF перезаписывает,
@@ -280,21 +369,33 @@ def main() -> int:
     except SystemExit:
         # RPC_DOWN посреди опроса: курсор уже покрытой discovery сохраняем,
         # иначе следующий проход переделывает весь скан логов заново.
+        # Вотч-лист тоже сохраняем — обнаруженные юзеры не теряются (#23).
         try:
             save_cursor(last_ok, cursor_path)
+            save_watchlist(users - zero_debt, watchlist_path)
             print(f"cursor saved at {last_ok} before RPC_DOWN")
         except Exception:
             pass
         raise
 
     pass_end = int(time.time())
+    # Persist вотч-листа: бездолговые вычтены, остальные перепроверяются в след. проходе
+    persisted_users = users - zero_debt
+    try:
+        save_watchlist(persisted_users, watchlist_path)
+    except Exception as e:
+        print(f"watchlist save failed: {e}")
     s = {"pass_start_ts": pass_start, "pass_end_ts": pass_end, "candidates_checked": checked,
          "liquidatable": liquidatable, "net_positive": net_positive,
          "sum_net_profit_usd": round(sum_net, 4), "data_unavailable": data_unavailable,
          "gas_assumed": gas_assumed,
          "rl_hits": get_rl_hits(), "last_ok_block": last_ok, "watchlist_truncated": truncated,
+         "watchlist_carried": len(carried), "watchlist_persisted": len(persisted_users),
+         "reserve_blocked": reserve_blocked, "emode_unreadable": emode_unreadable,
          "reserve_cache_size": len(reserve_cache),
+         "liq_fee_unreadable": sum(1 for i in reserve_cache.values() if i.get("liquidationProtocolFee") is None),
          "pol_price_usd": pol_price, "pol_price_source": "oracle" if pol_usd is not None else "assumed",
+         "swap_cost_pct_assumed": SWAP_COST_PCT_ASSUMED,
          "candidates": list(candidates.values())}
     # Persist курсора: следующий проход продолжит с last_ok + 1
     try:

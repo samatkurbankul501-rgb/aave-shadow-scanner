@@ -1,6 +1,6 @@
 # План реализации: Shadow-сканер ликвидаций Aave V3 (этап B)
 
-Дата: 2026-11-04 (синхронизировано с кодом 2026-11-10)
+Дата: 2026-11-04 (синхронизировано с кодом 2026-11-15)
 Спека: docs/superpowers/specs/2026-11-04-liquidator-scanner-design.md
 Маршрут: B (этот план) → C (testnet) → A (mainnet боевой контур). Не входит: контракт Solidity, flash loan, приватные ключи.
 
@@ -9,9 +9,9 @@
 - Stack: Python 3.11, только web3.py (+ pytest для тестов). Без async/фреймворков.
 - Корень проекта: C:/Users/User/Downloads/nn/ (git-репо; документы в docs/, код в scanner/, деплой в deploy/).
 - Файлы: scanner/rpc_client.py, scanner/discovery.py, scanner/calc.py, scanner/parser.py, scanner/reserves.py, scanner/logger.py, scanner/scan.py (точка входа), tests/test_calc.py, tests/test_parser.py, tests/test_scan.py, tests/test_reserves.py, tests/test_discovery.py, tests/fixtures/two_good_bad.json.
-- Имя переменных и интерфейсов — из спеки: connect(url)->Web3, rpc_call(w3, fn, *args), scan_range(w3, from_block, to_block)->(set, last_ok), net_profit(debt_usd, bonus_pct, flash_fee_pct, gas_usd)->float_usd, log_entry(dict), summary(dict).
+- Имя переменных и интерфейсов — из спеки: connect(url)->Web3, rpc_call(w3, fn, *args), scan_range(w3, from_block, to_block)->(set, last_ok), net_profit(debt_usd, bonus_pct, flash_fee_pct, gas_usd, swap_cost_pct=0.0)->float_usd, executable_cover_usd(hf, reserve_debt_usd, reserve_coll_usd, total_debt_usd, gross_bonus_pct)->(cover_usd, limit), top_position(...)->5-tuple (debt_asset, scaled_debt, coll_asset, coll_scaled, emode_category), log_entry(dict), summary(dict).
 - Форматы логов из спеки: JSONL {ts, user, hf, debt_usd, collateral_usd, net_profit_usd, block, block_hash}; сводный JSON {pass_start_ts, pass_end_ts, candidates_checked, liquidatable, net_positive, sum_net_profit_usd, candidates}.
-- Баунды из спеки: порог долга $50, HF < 1.0, confirmations 16, вотч-лист лимит 5000, батч 200 блоков адаптивный (сжатие пополам до MIN_BATCH=5), rate limit ~10 req/s, backoff Retry-After минимум 5с, data_unavailable < 5%.
+- Баунды из спеки: порог долга $50, HF < 1.0, confirmations 16, вотч-лист лимит 5000 (персистентный watchlist.txt, бездолговые вычищаются после опроса), батч 200 блоков адаптивный (сжатие пополам до MIN_BATCH=5), rate limit ~10 req/s, backoff Retry-After минимум 5с, data_unavailable < 5%, MIN_LEFTOVER_BASE=$1000 (анти-пылевое правило origin LiquidationLogic).
 
 ---
 
@@ -20,7 +20,7 @@
 Файлы: scanner/calc.py, tests/test_calc.py
 Цель: чистая функция net_profit без RPC.
 Шаги:
-1. Создать scanner/__init__.py (пустой) и scanner/calc.py с функцией net_profit(debt_usd: float, bonus_pct: float, flash_fee_pct: float, gas_usd: float) -> float_usd.
+1. Создать scanner/__init__.py (пустой) и scanner/calc.py с функцией net_profit(debt_usd: float, bonus_pct: float, flash_fee_pct: float, gas_usd: float, swap_cost_pct: float = 0.0) -> float_usd. Формула: debt×(1+bonus/100)×(1−swap_cost/100) − debt×(1+flash_fee/100) − gas; swap_cost_pct=0 даёт старую формулу (спека $9.89).
 2. Написать tests/test_calc.py с 3 тестами: (a) спечная цифра $9.89 (долг $200, бонус 5%, fee 0.05%, gas $0.01); (b) net = 0 при bonus ровно = fee+gas; (c) net отрицателен когда bonus < fee. Ожидаемый net = debt*bonus - debt*fee - gas.
 3. Запустить pytest tests/test_calc.py -q → все PASS.
 Проверка: pytest -q (3 passed).
@@ -33,7 +33,7 @@
 1. Реализовать connect(url): Web3(Web3.HTTPProvider(url, request_kwargs={'timeout': 10})), проверка w3.is_connected() → иначе raise SystemExit('RPC_DOWN'); проверка chain_id == 137 → иначе SystemExit('WRONG_CHAIN').
 2. Реализовать rpc_call(w3, fn, *args): try/except; при 429 — backoff по Retry-After (минимум 5с), инкремент rl_hits; 3 подряд → raise SystemExit('RPC_DOWN'); при timeout — 1 ретрай 2с. Throttle минимум 100ms между вызовами.
 3. Реализовать get_block_number(w3) через свойство w3.eth.block_number (метода get_block_number у web3.py нет).
-4. Тест ручной: python -c "from scanner.rpc_client import connect; print(connect('https://polygon-bor-mainnet.public.blastapi.io').eth.block_number)" — должен печатать номер блока.
+4. Тест ручной: python -c "from scanner.rpc_client import connect; print(connect('https://polygon.drpc.org').eth.block_number)" — должен печатать номер блока.
 Проверка: ручной вызов печатает блок (не RPC_DOWN).
 
 ## Задача 3. discovery.py (скан логов Pool)
@@ -62,7 +62,7 @@
 Цель: CLI-проход из спеки (поток 30-60 сек при малом вотч-листе; при 5000 адресов и throttle 100 мс — до ~13 мин).
 Шаги:
 1. argparse: --rpc (обязательный), --from_block (int, дефолт = текущий - 10000), --out (папка логов, дефолт logs).
-2. Связать компоненты: connect → scan_range → getUserAccountData по вотч-листу (лимит 5000, детерминированный срез sorted(users)[:5000]; долг неизвестен до опроса, вытеснение бездолговых невозможно) → calc.net_profit (fee = 0.05% фикс для оценки; closeFactor по контракту calc.coverable_debt: 100% по умолчанию, cap 50% общего долга только при HF>0.95 и обоих резервах >=$2000; debtToCover с топ-актива через borrowIndex; gas по eth_estimateGas от реального ликвидатора с balanceOf+allowance на реальных liquidationCall-аргументах; revert/нет ликвидатора → gas_assumed + net по fallback-газу (GAS_EST_DEFAULT); чтения пиннятся к last_ok) → logger.log_entry/summary. Курсор персистится в logs/cursor.txt и продолжается всегда (resume_from_block), явный --from_block побеждает.
+2. Связать компоненты: connect → scan_range → getUserAccountData по вотч-листу (персистентный watchlist.txt ∪ новые; лимит 5000, детерминированный срез sorted(users)[:5000]; бездолговые вычищаются после опроса) → calc.net_profit (fee = 0.05% фикс для оценки; топ-активы по USD через кэш резервов; eMode-бонус категории при коллатерале в bitmap; inactive/paused/grace-резервы блокируются (reserve_blocked); покрытие — calc.executable_cover_usd: closeFactor по контракту (100% по умолчанию, cap 50% общего долга только при HF>0.95 и обоих резервах >=$2000) + достаточность коллатерала + анти-пылевое правило $1000; debtToCover с топ-актива через borrowIndex; gas по eth_estimateGas от реального ликвидатора с balanceOf+allowance на реальных liquidationCall-аргументах; revert/нет ликвидатора → gas_assumed + net по fallback-газу (GAS_EST_DEFAULT); чтения пиннятся к last_ok) → logger.log_entry/summary. Курсор персистится в logs/cursor.txt и продолжается всегда (resume_from_block), явный --from_block побеждает; вотч-лист сохраняется и при RPC_DOWN.
 3. Сухой запуск: python -m scanner.scan --rpc <RPC> --from_block <N> --out logs_smoke → должен завершить проход, записать JSONL + сводный JSON.
 4. Проверка реорга: передавать block_number - 16 как confirmations (глубина 16).
 Проверка: сводный JSON напечатан, JSONL файл существует с 0..N строками.
