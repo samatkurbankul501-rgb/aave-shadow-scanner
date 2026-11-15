@@ -86,3 +86,21 @@ journalctl -u aave-scanner -f
 Вести 14 дней. Переход только если:
 всего >=5 кандидатов с net_profit_usd > $3 И >=1 с > $10.
 Иначе протокол не подходит — идти на Venus/Moonwell тем же кодом.
+
+## 6. Фактический деплой на dell-r740 (2026-11-15, user-space)
+
+sudo на сервере требует пароль, поэтому развёрнуто БЕЗ root, в пользовательском
+пространстве (systemd/ufw/logrotate из разделов выше не устанавливались):
+
+- `~/aave-scanner` — git clone HEAD (публичный репо), `.venv` (Python 3.14, web3 8.0.0)
+- `.env` (chmod 600): `POLYGON_RPC=https://polygon.drpc.org`
+- `run_pass.sh` — один проход под `flock` (без наложений) и `nice 10`, лог `logs/runner.log`
+- user crontab: `*/5 * * * * $HOME/aave-scanner/run_pass.sh` + ежедневная 04:10
+  чистка `pass_*.json`/`candidates_*.jsonl` старше 21 дня и trim runner.log
+  (cursor.txt/watchlist.txt не удаляются)
+- Проверка: `ssh dell-r740 'crontab -l; tail ~/aave-scanner/logs/runner.log; ls -t ~/aave-scanner/logs/pass_*.json | head'`
+- Грабля: под `set -e` конструкция `(crontab -l | grep -v ...; echo ...) | crontab -`
+  на пустом crontab обрывает subshell (grep exit 1) и ставит ПУСТОЙ crontab;
+  использовать `(crontab -l 2>/dev/null || true; echo ...) | crontab -`
+- Переход на systemd (разделы 1-4) возможен, когда появится sudo; до тех пор
+  cron-проход эквивалентен: курсор и вотч-лист персистятся между проходами.
